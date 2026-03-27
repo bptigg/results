@@ -6,6 +6,7 @@ from matplotlib.lines import Line2D
 from mpl_toolkits import mplot3d
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
+import mmap
 
 class DataPoint:
     def __init__ (self, B, population, Header, color, secondary_coord=0.0):
@@ -73,20 +74,12 @@ class DataView:
              
 
 def read_file(filename):
-    lines = []
-    with open(filename, 'r') as f:
-        for line in f:
-            seperator = ' '
-            strs = []
-            current_string = ""
-            for c in line:
-                if c == seperator:
-                    strs.append(current_string)
-                    current_string = ""
-                else:
-                    current_string += c
-            lines.append(strs)
-    return lines
+    with open(filename, "rb") as f:
+        with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
+            lines = []
+            for line in iter(mm.readline, b""):
+                lines.append(line.decode('utf-8').split())
+            return lines
 
 cmp_init = False
 colours_dict ={}
