@@ -1,0 +1,94 @@
+import re
+import numpy as np
+
+def extract_all_eigenvectors(file_path):
+    with open(file_path, 'r') as f:
+        content = f.read()
+
+    # Regex to find the content between the eigenvector headers
+    # Each task is delimited by "Printing Eigenvectors" and "End of Eigenvectors"
+    task_pattern = re.compile(
+        r"------ Printing Eigenvectors \(one per column\) ------(.*?)------ End of Eigenvectors ------", 
+        re.DOTALL
+    )
+    
+    # Regex to capture individual complex number pairs like (+1.000e+00,+0.000e+00) or (0,0)
+    val_pattern = re.compile(r"\(([^,]+),([^)]+)\)")
+
+    all_matrices = []
+    
+    tasks = task_pattern.findall(content)
+    
+    for task_content in tasks:
+        # Extract all numbers from the block
+        matches = val_pattern.findall(task_content)
+        
+        # Convert string pairs to complex numbers
+        data = [complex(float(r), float(i)) for r, i in matches]
+        
+        if data:
+            # Reshape into a 9x9 matrix (data is printed row by row in the file)
+            # The file notes "one per column", meaning each column in this 9x9 is a vector
+            matrix = np.array(data).reshape(9, 9)
+            all_matrices.append(matrix)
+
+    return all_matrices
+
+def track_eigenstate_labels(evecs, basis_labels):
+    """
+    Track eigenstate identities across a parameter sweep using overlap matching.
+
+    Parameters
+    ----------
+    evecs : list of ndarray
+        evecs[k] is an (N,N) matrix whose columns are eigenvectors at field index k.
+    basis_labels : list
+        basis_labels[i] is the label for basis state i, e.g. (-1,+1), (-1,0), ...
+
+    Returns
+    -------
+    labels : list of list
+        labels[k][n] = label assigned to eigenstate n at field index k.
+    """
+
+    K = len(evecs)          # number of field points
+    N = evecs[0].shape[0]   # dimension (should be 9 for NV+14N)
+
+    labels = [[None]*N for _ in range(K)]
+
+    # --- Step 1: assign labels at high field (last index) ---
+    k0 = K - 1
+    for n in range(N):
+        vec = evecs[k0][:, n]
+        weights = np.abs(vec)**2
+        dominant_basis_index = np.argmax(weights)
+        labels[k0][n] = basis_labels[dominant_basis_index]
+
+    # --- Step 2: propagate labels backwards using overlaps ---
+    for k in reversed(range(K - 1)):
+        # Overlap matrix between eigenvectors at k and k+1
+        O = np.abs(evecs[k].conj().T @ evecs[k+1])**2
+
+        used = set()
+        for m in range(N):
+            # find best match at previous step
+            n = np.argmax(O[:, m])
+            while n in used:
+                O[n, m] = -1
+                n = np.argmax(O[:, m])
+            used.add(n)
+            labels[k][n] = labels[k+1][m]
+
+    return labels
+
+
+matrices = extract_all_eigenvectors('eigenvalues_es_Z.log')
+print(f"Extracted {len(matrices)} sets of eigenvectors.")
+
+basis_labels = [
+    (-1,+1), (-1,0), (-1,-1),
+    (0,+1), (0,0), (0,-1),
+    (+1,+1), (+1,0), (+1,-1)
+]
+
+labels = track_eigenstate_labels(matrices, basis_labels)
