@@ -146,12 +146,19 @@ class DataView:
              
 
 def read_file(filename):
-    with open(filename, "rb") as f:
-        with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
-            lines = []
-            for line in iter(mm.readline, b""):
-                lines.append(line.decode('utf-8').split())
-            return lines
+    if isinstance(filename,str):
+        with open(filename, "rb") as f:
+            with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
+                lines = []
+                for line in iter(mm.readline, b""):
+                    lines.append(line.decode('utf-8').split())
+                return lines
+    elif isinstance(filename,io.BytesIO):
+        lines = []
+        for line in filename:
+            lines.append(line.decode('utf-8').split())
+        return lines
+
         
 def save_data_npz(lines, filename):
     header_names = lines[0]
@@ -176,16 +183,19 @@ def ProcessFile(filename,new_filename = ""):
     save_data_npz(read_file(f), new_filename)
     return new_filename + ".npz"
 
-def ProcessFileSSH(filename, new_filename = "", host = "", user = "", password = ""):
+def ProcessFileSSH(filename, new_filename = "", dict = "",host = "", user = "", password = ""):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
         ssh.connect(hostname=host, username=user, password=password)
+        print("connected")
         with ssh.open_sftp() as sftp:
             if(new_filename == ""):
                 new_filename = filename
             remote_path = filename + ".dat"
             file_buffer = io.BytesIO()
+            #print(sftp.listdir('.'))
+            sftp.chdir(dict)
             sftp.getfo(remotepath=remote_path,fl=file_buffer)
             file_buffer.seek(0)
             data = read_file(file_buffer)
@@ -207,6 +217,7 @@ def ProcessFileSSH(filename, new_filename = "", host = "", user = "", password =
 
     print("Script will open npz file of same name, if this is not the first time it has been run")
     return False
+
 
 
 
