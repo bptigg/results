@@ -6,6 +6,7 @@ import time
 import threading
 import paramiko
 import io
+import socket
 
 class DataPointCollection:
     def __init__(self,filename,_internal_data=None,_internal_groups=None, _internal_indices=None):
@@ -175,7 +176,7 @@ def ProcessFile(filename,new_filename = ""):
     save_data_npz(read_file(f), new_filename)
     return new_filename + ".npz"
 
-def ProcessFile(filename, new_filename = "", host = "", user = "", password = ""):
+def ProcessFileSSH(filename, new_filename = "", host = "", user = "", password = ""):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -189,9 +190,23 @@ def ProcessFile(filename, new_filename = "", host = "", user = "", password = ""
             file_buffer.seek(0)
             data = read_file(file_buffer)
             save_data_npz(data, new_filename)
-            return new_filename + ".npz"
+            return new_filename + ".npz", True
+    except paramiko.AuthenticationException:
+        print("Error: Authentication failed. Please check your username/password.")
+        #return None
+    except paramiko.SSHException as ssh_err:
+        print(f"Error: SSH connection failed: {ssh_err}")
+        #return None
+    except socket.error as sock_err:
+        print(f"Error: Network unreachable or timeout: {sock_err}")
+        #return None
+    except(paramiko.SSHException, socket.error) as e:
+        print(f"Connection failed {e}")
     finally:
         ssh.close()
+
+    print("Script will open npz file of same name, if this is not the first time it has been run")
+    return False
 
 
 
