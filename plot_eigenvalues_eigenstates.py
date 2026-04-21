@@ -6,6 +6,7 @@ import numpy as np
 from matplotlib.lines import Line2D
 import math
 import mmap
+from DataManagment import DataPointCollection, DataView
 
 class DataPoint:
     def __init__(self, x, eigenvalues, state_index, weighting,colour, state):
@@ -13,53 +14,19 @@ class DataPoint:
         self.weighting = weighting
         self.state_index = state_index
         self.x = x
+        #self.y = y
         self.colour = colour
         self.state = state
 
-class DataPointCollection:
-    def __init__(self,filename):
-        self.data = np.load(filename, allow_pickle=True, mmap_mode='r')
-        self._group_map = self.data['_group_map']
-        self._time_steps = self.data['_timesteps']
-        self.unique_groups = np.unique(self._group_map)
-        self.cached_keys = [k for k in self.data.files if k != '_group_map']
-
-    def __len__(self):
-        return len(self.unique_groups)
-    def __getitem__(self, key):
-        indices = np.where(self._group_map == key)[0]
-        return [DataView(self.data, self.GetKeys(), i) for i in indices]
-    def GetKeys(self):
-        return self.cached_keys
-
-class DataView:
-    def __init__(self, master_collection,keys, index):
-        self.master = master_collection
-        self.i = index
-        self.keys = keys
-        self._cache = {}
-
-    def __getattr__(self, name):
-        if name in self._cache:
-            return self._cache[name]
-        
-        if name in self.keys:
-            val = self.master[name][self.i]
-            if hasattr(val,'item') and not isinstance(val, np.ndarray):
-                val = val.item()
-            self._cache[name] = val
-            return val
-        raise AttributeError(f"'DataView' object has no attribute '{name}'")
-    
-    def __repr__(self):
-        return f"<DataView index={self.i} header={self.Header}>"
 
 def load_block(collection : DataPointCollection, idx):
-    mask = collection._group_map == collection.unique_groups[idx]
-    dat_x = collection.data['x'][mask]
+    collection.last_accessed_group = idx
+    group_id = collection.unique_groups[idx]
+    indicies = collection._index_map[group_id]
+    dat_x = collection.data['x'][indicies]
     #dat_y = collection.data['sc'][mask]
-    dat_c = collection.data['colour'][mask]
-    dat_z = collection.data['eigenvalues'][mask]
+    dat_c = collection.data['colour'][indicies]
+    dat_z = collection.data['eigenvalues'][indicies]
 
     return dat_x, dat_z, dat_c
 
@@ -119,13 +86,13 @@ def GetMax(values):
 
 cmp_init = False
 colours_dict ={}
-def StartColourMap(eigenvectors):
+def StartColourMap(eigenvectors, map = 'tab10'):
     global cmp_init
     if cmp_init:
         return
     #cmap = mpl.colormaps['magma']
     #colors = cmap(np.linspace(0, 1, eigenvectors))
-    cmap = mpl.colormaps['tab10']
+    cmap = mpl.colormaps[map]
     colors = cmap.colors
     cmp_init = True
     for i, colour in enumerate(colors):
@@ -193,7 +160,7 @@ def CollectEigenstates(data, eigenvalues, offset, x_index, state_headers):
     #PlotEigenvaluesWithWeightings(B_all, E, W)
     return DataPoints
 
-def CollectEigenstatesTR(data, eigenvalues, offset, x_index, y_index = -1, sets : int = 1, state_headers = [], max_steps = -1):
+def CollectEigenstatesTR(data, eigenvalues, offset, x_index, y_index = -1, sets : int = 1, state_headers = [], max_steps = -1, max_timestep = -1):
     DataPoints = [[]]
     global colours_dict
     StartColourMap(eigenvalues+1)
@@ -212,6 +179,9 @@ def CollectEigenstatesTR(data, eigenvalues, offset, x_index, y_index = -1, sets 
                 if(step >= max_steps):
                     DataPoints.remove([])
                     break
+        if(max_timestep != -1):
+            if(float(data[d][1]) >= max_timestep):
+                continue
         DataPoints[step].append([])
         x = float(data[d][x_index])
         weights = [[] for _ in range(sets)]
@@ -253,7 +223,26 @@ def CollectEigenstatesTR(data, eigenvalues, offset, x_index, y_index = -1, sets 
                         if dat[2][i][1] > id:
                             id = dat[2][i][1]
                             state_id = i
-                    DataPoints[step][d-offset_D].append(DataPoint([x],[eigenvalue_value[set_idx][eig]], eig, dat[2][state_id][1],[(0.0, 0.0, 0.0, 1.0)], ['mixed']))
+                    #state = dat[2][state_id][0]
+                    #total_color = colours_dict[state]
+                    #sum all the colors together weighted by their contribution to the state
+                    #total_color = (0.0, 0.0, 0.0, 1.0)
+                    #for i in range(0,len(dat[2])):
+                    #    state = dat[2][i][0]
+                    #    contribution = dat[2][i][1]
+                    #    color = colours_dict[state]
+                    #    total_color = (total_color[0] + color[0] * contribution, total_color[1] + color[1] * contribution, total_color[2] + color[2] * contribution, 1.0)
+                    #DataPoints[step][d-offset_D].append(DataPoint([x],[eigenvalue_value[set_idx][eig]], eig, dat[2][state_id][1], [total_color], ['mixed']))
+                    #need to find a better way to represent the mixed states that doesn't just average the colors but asssignes a new color
+                    color_contributions = [colours_dict[eig]]
+                    states = []
+                    for i in range(0,len(dat[2])):
+                        state = dat[2][i][0]
+                        contribution = dat[2][i][1]
+                        color = colours_dict[state]
+                        color_contributions.append((color[0], color[1], color[2], contribution))
+                        states.append('line ' + str(eig))
+                    DataPoints[step][d-offset_D].append(DataPoint([x],[eigenvalue_value[set_idx][eig]], eig, dat[2][state_id][1], color_contributions, states))
         idx += 1
     return DataPoints
 
@@ -267,23 +256,31 @@ def GetStateHeader(lineheader, eigenvalues, ignore_indices, offset):
         state_headers.append(lineheader[offset + ((i+1) * eigenvalues)])
     return state_headers
 
-def assign_state_to_colour(data_points, state_headers, sets):
+def assign_state_to_colour(data_points, state_headers, sets = 2, max_states = -1):
     state_to_colour = {}
     all_states = False
     num_states_found = 0
-    num_states = len(data_points)
+    if(max_states != -1):
+        num_states = max_states
+    else:
+        num_states = len(data_points)
     state_to_colour['mixed'] = (0.0,0.0,0.0,1.0)
     for DP in data_points: 
+        index = 0
         for dp in DP:
             #if dp.eigenvalues == []:
             #    continue
-            state = dp.state[0]
+            if(state_headers != []):
+                state = state_headers[index]
+            else:
+                state = dp.state[0]
             colour = dp.colour[0]
             if state != 'mixed' and state not in state_to_colour:
                 state_to_colour[state] = colour
                 num_states_found += 1
             if(num_states_found == num_states):
                 all_states = True
+            index += 1
         if(all_states):
             break
     return state_to_colour
@@ -296,10 +293,35 @@ def PlotEigenstates(DataPoints, lineheader):
     #ax.add_collection(lc)
     #ax.set_xlim(ax.dataLim.x0, ax.dataLim.x1)
     #ax.set_ylim(ax.dataLim.y0, ax.dataLim.y1)
-    xs = [o for d in DataPoints for i in d for o in i.x]
-    ys = [o for d in DataPoints for i in d for o in i.eigenvalues]
-    cs = [o for d in DataPoints for i in d for o in i.colour]
-    state_dict = assign_state_to_colour(DataPoints, lineheader)
+    xs,ys,cs = [],[],[]
+    all_indicies = np.concatenate([DataPoints._index_map[group_id] for group_id in DataPoints.unique_groups])
+
+    def flatten(lst):
+        if lst.dtype != object:
+            return lst.ravel()
+        return np.concatenate(lst)
+    
+    xs = flatten(DataPoints.data['x'][all_indicies])
+    ys = flatten(DataPoints.data['eigenvalues'][all_indicies])
+    cs = flatten(DataPoints.data['colour'][all_indicies])
+    #for d in range(0,len(DataPoints)):
+    #    x,y,c = load_block(DataPoints,d)
+    #    xs.append(x.ravel())
+    #    ys.append(y.ravel())
+    #    cs.append(c.ravel())
+    #    #x2 = [o for i in x for o in i]
+    #    #y2 = [o for i in y for o in i]
+    #    #c2 = [o for i in c for o in i]
+    #    #xs = np.concatenate((xs,x2))
+    #    #ys = np.concatenate((ys,y2))
+    #    #if len(cs) == 0:
+    #    #    cs = c2
+    #    #else:
+    #    #    cs = np.concatenate((cs,c2))
+    #xs = [o for d in DataPoints for i in d for o in i.x]
+    #ys = [o for d in DataPoints for i in d for o in i.eigenvalues]
+    #cs = [o for d in DataPoints for i in d for o in i.colour]
+    state_dict = assign_state_to_colour(DataPoints, [], sets=1, max_states=len(lineheader))
     ax.scatter(xs, ys, color=cs, s=20, edgecolors='none')
 
     legend_elements = [
@@ -318,24 +340,99 @@ def PlotEigenstates(DataPoints, lineheader):
 def PlotTREigenStates(DataPoints, lineheader, sets,eig):
     plots = len(DataPoints)
     for p in range(plots):
+        xs, ys, cs = load_block(DataPoints,p)
+        x_grid = xs.reshape(-1, sets, eig)
+        y_grid = ys.reshape(-1, sets, eig)
+        c_grid = cs.reshape(len(x_grid), sets, eig, -1)
+        #num_blocks = xs.shape[0] // (sets*eig)
         for s in range(sets):
-            fig, ax = plt.subplots()
-            xs, ys, cs = load_block(DataPoints,p)
-            xs = [o for x in range(0,len(xs),sets*eig) for o in xs[x + (s*eig):x + ((s+1)*eig)]]
-            ys = [o for x in range(0,len(ys),sets*eig) for o in ys[x + (s*eig):x + ((s+1)*eig)]]
-            cs = [o for x in range(0,len(cs),sets*eig) for o in cs[x + (s*eig):x + ((s+1)*eig)]]
-            modified_data_points = DataPoints[p][0:sets*eig][s*eig:(s+1)*eig]
-            state_dict = assign_state_to_colour([modified_data_points], lineheader[s], sets=sets)
-            ax.scatter(xs, ys, color=cs, s=20, edgecolors='none')
+            x_dat = x_grid[:,s,:].ravel()
+            y_dat = y_grid[:,s,:].ravel()
+            c_dat = c_grid[:,s,:,:].reshape(-1, c_grid.shape[-1])
+            #x = [o for x in range(0,len(xs),sets*eig) for o in xs[x + (s*eig):x + ((s+1)*eig)]]
+            #y = [o for x in range(0,len(ys),sets*eig) for o in ys[x + (s*eig):x + ((s+1)*eig)]]
+            #cs = [o for x in range(0,len(cs),sets*eig) for o in cs[x + (s*eig):x + ((s+1)*eig)]]
+            #c =[o[0] for o in cs]
+            #c = [(o[0], o[1], o[2], 1.0) for o in c]
+            #c_flat = cs.reshape(-1, cs.shape[-1])
+            #c = np.column_stack((c_flat[:,0], c_flat[:,1], c_flat[:,2], np.ones(c_flat.shape[0])))
 
-            legend_elements = [
-            Line2D([0],[0], marker='o', color='w', markerfacecolor=color, markersize=10, label=legend_label) for legend_label, color in state_dict.items()
-            ]
-            ax.legend(handles=legend_elements, title="Eigenstates", loc='upper right')
+            #modified_data_points = DataPoints[p][0:sets*eig][s*eig:(s+1)*eig]
+            headers = [f"line {i}" for i in range(eig)]
+            #state_dict = assign_state_to_colour([modified_data_points], headers, sets=sets)
+            #PlotMixedStateContributions(x,cs, lineheader[s],eig, state_dict, headers)
+            fig, ax = plt.subplots()
+            #ax.scatter(x, y, color=c, s=20, edgecolors='none')
+            ax.scatter(x_dat, y_dat, s=20, edgecolors='none')
+
+            #legend_elements = [
+            #Line2D([0],[0], marker='o', color='w', markerfacecolor=color, markersize=10, label=legend_label) for legend_label, color in state_dict.items()
+            #]
+            #ax.legend(handles=legend_elements, title="Eigenstates", loc='upper right')
 
             ax.set_xlabel('Time (ns)')
             ax.set_ylabel('Eigenvalues (rad/ns)')
+            print(f"Plotted set {s} of plot {p}")
+            #plt.show(block=False)
+            #input("Close plots")
+            #plt.close('all')
+            #plt.draw()
             plt.show()
+
+def PlotMixedStateContributions(x, contributions, lineheader,eig, state_dict, headers):
+    y_all = []
+    c_all = []
+    for i in range(0,len(contributions),eig):
+        y_t = []
+        c_t = []
+        for e in range(eig):
+            contribution = contributions[i + e]
+            y = []
+            c_list = []
+            for c in contribution[1:]:
+                color = (c[0], c[1], c[2], 1.0)
+                value = c[3]
+                y.append(value)
+                c_list.append(color)
+            y_t.append(y)
+            c_t.append(c_list)
+        y_all.append(y_t)
+        c_all.append(c_t)
+    for i in range(eig):
+        fig, ax = plt.subplots()
+        y = [y_all[t][i] for t in range(len(y_all))]
+        c = [c_all[t][i] for t in range(len(c_all))]
+        y_unpacked = []
+        c_unpacked = []
+        time = []
+        for t in range(len(y)):
+            for s in range(len(y[t])):
+                y_unpacked.append(y[t][s])
+                c_unpacked.append(c[t][s])
+                time.append(x[t*eig])
+        ax.scatter(time, y_unpacked, color=c_unpacked, s=20, edgecolors='none')
+        all_colors = list(set(tuple(color) for sublist in c for color in sublist))
+        states = [lineheader[StateByColor(color)] for color in all_colors]
+
+        legend_elements = [
+        Line2D([0],[0], marker='o', color='w', markerfacecolor=all_colors[i], markersize=10, label=states[i]) for i in range(len(all_colors))
+        ]
+        ax.legend(handles=legend_elements, title="Eigenstates", loc='upper right')
+
+        ax.set_title(f"Overlap of reference states to the mixed state in {headers[i]}")
+        ax.set_xlabel('Time (ns)')
+        ax.set_ylabel('Overlap')
+        plt.draw()
+    plt.show()
+        
+
+def StateByColor(color):
+    if color in colours_dict.values():
+        for state, col in colours_dict.items():
+            if col == color:
+                return state
+    return None
+
 
 def save(filename, eigenvalues):
     twod_list = []
@@ -343,6 +440,8 @@ def save(filename, eigenvalues):
     timestep = []
     for group_idx, sub_list in enumerate(eigenvalues):
         for p in sub_list:
+            if type(p) != list:
+                p = [p]
             for i in range(len(p)):
                 group_ids.append(group_idx)
             twod_list.append(p)
@@ -360,8 +459,11 @@ def save(filename, eigenvalues):
         data = [getattr(p,var_name) for p in flat_list]
         save_dict[var_name] = np.array(data, dtype=object)
 
-    np.savez_compressed(filename, **save_dict)
+    np.savez(filename, **save_dict)
     print(f"Saved variables: {list(sample_vars)}")
+
+#def GetEnergyDifference(data, state1, state2):
+    #energy_diff = []
 
 def load(filename):
     filename = filename + ".npz"
@@ -370,35 +472,58 @@ def load(filename):
 
 
 def main():
-    lines = read_file("NV_centre_N14_0T_eig.dat")
+    #lines = read_file("NV_centre_N14_0T_eig.dat")
+    file = "NV_centre_N14_GLASC_Z_eig_strain"
+    lines = fast_read(file + ".dat")
     eigenvalues = 9
-    offset = 3
-    Header = lines[0]
+    offset = 3 #for gs
+    #for es 
+    offset_es = 3 + (eigenvalues + 1) * eigenvalues
+    #Header = lines[0]
     #state_headers = GetStateHeader(Header, eigenvalues, [6,7,8])
-    state_headers = GetStateHeader(Header, eigenvalues, [])
+    #state_headers = GetStateHeader(Header, eigenvalues, [], offset)
+    state_headers = [["GS.T0_U", "GS.T0_Z", "GS.T0_D", "GS.TD_U", "GS.TD_Z", "GS.TD_D", "GS.TP_U", "GS.TP_Z", "GS.TP_D"], ["ES.T0_U", "ES.T0_Z", "ES.T0_D", "ES.TP_U", "ES.TP_Z", "ES.TP_D", "ES.TD_U", "ES.TD_Z", "ES.TD_D"]]
     Data = lines[1:len(lines)]
-    DataPoints = CollectEigenstates(Data, eigenvalues, offset, 2, state_headers)
-    PlotEigenstates(DataPoints,state_headers)
+    #DataPoints = CollectEigenstates(Data, eigenvalues, offset_es, 2, state_headers[1])
+    DataPoints = CollectEigenstates(Data, eigenvalues, offset, 2, state_headers[0])
+    #save(file + "_es", DataPoints)
+    save(file + "_gs", DataPoints)
+    StartColourMap(eigenvalues+1)
+    #DataPoints = load(file + "_es")
+    DataPoints = load(file + "_gs")
+    PlotEigenstates(DataPoints,state_headers[0])
+    #plt.show()
 
 def PlotTimeResolvedEigenStates():
     #lines = read_file("NV_centre_N14_01T_eig-test.dat")
-    lines = fast_read("NV_centre_N14_01T_eig-test.dat")
+    #file = "NV_centre_N14_01T_eig-test"
+    file = "NV_centre_N14_GLASC_Z_eig_strain_mod"
+    #file = "eigenvalues_gs_Z"
+    #lines = fast_read(file + ".dat")
     eigenvalues = 9
-    offset = 4
-    Header = lines[0]
+    offset = 3
+    #Header = lines[0]
     #state_headers = GetStateHeader(Header, eigenvalues, [])
     state_headers = [["GS.T0_U", "GS.T0_Z", "GS.T0_D", "GS.TP_U", "GS.TP_Z", "GS.TP_D", "GS.TD_U", "GS.TD_Z", "GS.TD_D"], ["ES.T0_U", "ES.T0_Z", "ES.T0_D", "ES.TP_U", "ES.TP_Z", "ES.TP_D", "ES.TD_U", "ES.TD_Z", "ES.TD_D"]]
-    Data = lines[1:len(lines)]
-    DataPoints = CollectEigenstatesTR(Data, eigenvalues, 4, 1, sets=2, state_headers=state_headers, max_steps=5)
-    save("NV_centre_N14_01T_eig-test", DataPoints)
-    DataPoints = load("NV_centre_N14_01T_eig-test")
+    #Data = lines[1:len(lines)]
+    #DataPoints = CollectEigenstatesTR(Data, eigenvalues, offset, 1, sets=2, state_headers=state_headers, max_timestep = 100)
+    #DataPoints = CollectEigenstates(Data, eigenvalues, offset, 2, state_headers[0])
+    #save(file, DataPoints)
+    StartColourMap(eigenvalues+1)
+    DataPoints = load(file)
     PlotTREigenStates(DataPoints,state_headers, sets=2,eig=eigenvalues)
+    #PlotEigenstates(DataPoints,state_headers[0])
+    #GetEnergyDifference(DataPoints, "GS.T0_U", "GS
+    plt.show()
 
 
 
 
 
 #main()
-PlotTimeResolvedEigenStates()
+#PlotTimeResolvedEigenStates()
+if __name__ == "__main__":
+    #main()
+    PlotTimeResolvedEigenStates()
 
 

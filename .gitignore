@@ -1,3 +1,5 @@
 *.dat
 *.npz
 *.log
+*.pyc
+*.png
