@@ -160,8 +160,8 @@ def read_file(filename):
         return lines
 
         
-def save_data_npz(lines, filename):
-    header_names = lines[0]
+def save_data_npz(header_names,lines, filename):
+    #header_names = lines[0]
     data_rows = np.array(lines[1:])
     save_dict = {}
     save_dict['_group_map'] = data_rows[:,0]
@@ -175,19 +175,46 @@ def save_data_npz(lines, filename):
     np.savez(filename, **save_dict)
     print(f"Saved {filename} to .npz file")
 
-def ProcessFile(filename,new_filename = ""):
-    #readfile
-    if(new_filename == ""):
-        new_filename = filename
-    f = filename + ".dat"
-    save_data_npz(read_file(f), new_filename)
-    return new_filename + ".npz"
+def ProcessFile(filenames,new_filenames = [""]):
+    if isinstance(filenames, str):
+        filenames = [filenames]
+    if isinstance(new_filenames, str):
+        new_filenames = [new_filenames]
+    for new_filenames in new_filenames:
+        if new_filenames == "":
+            new_filenames = [filenames[i] for i in range(len(filenames))]
+    all_data_rows = []
+    master_headers = None
+    for i, fname in enumerate(filenames):
+        f = fname + ".dat"
+        lines = read_file(f)
+        if not lines:
+            print(f"Warning: File {f} is empty or could not be read.")
+            continue
+        header_names = lines[0]
+        data_rows = np.array(lines[1:])
+        data_rows[:,0] = np.char.add(data_rows[:,0].astype(str), f"_f{i}")
+        if i == 0:
+            master_headers = header_names
+        all_data_rows.append(data_rows)
+    if master_headers is None:
+        print("Error: No valid files were processed.")
+        return None
+    if all_data_rows:
+        combined_data = np.vstack(all_data_rows)
+        save_data_npz(master_headers, combined_data, new_filenames[0])
+        return new_filenames[0] + ".npz"
+    else:
+        print("Error: No valid data rows were found in the files.")
+        return None
 
-def ProcessFileSSH(filename, new_filename = "", dict = "",host = "", user = "", password = ""):
+
+def ProcessFileSSH(filename, new_filename = "", dict_path = "",host = "", user = "", password = None, key_path = None):
     ssh = paramiko.SSHClient()
+    ssh.load_system_host_keys()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        ssh.connect(hostname=host, username=user, password=password)
+        ssh.connect(hostname=host, username=user, password=password,key_filename=key_path,look_for_keys=True,timeout=20)
         print("connected")
         with ssh.open_sftp() as sftp:
             if(new_filename == ""):
@@ -195,7 +222,8 @@ def ProcessFileSSH(filename, new_filename = "", dict = "",host = "", user = "", 
             remote_path = filename + ".dat"
             file_buffer = io.BytesIO()
             #print(sftp.listdir('.'))
-            sftp.chdir(dict)
+            if(dict_path):
+                sftp.chdir(dict_path)
             sftp.getfo(remotepath=remote_path,fl=file_buffer)
             file_buffer.seek(0)
             data = read_file(file_buffer)
@@ -221,3 +249,34 @@ def ProcessFileSSH(filename, new_filename = "", dict = "",host = "", user = "", 
 
 
 
+class ExponentiallyWeightedMovingAverage:
+    def __init__(self, tau, mean = None):
+        self.tau = tau
+        self.mean = mean
+        self.var = 0.0
+
+        self.tau2 = tau * 100
+        self.mean_std = None
+        self.var_std = 0.0
+    def update(self,current_val,dt):
+        alpha = 1.0 - np.exp(-dt / self.tau)
+        alpha2 = 1.0 - np.exp(-dt / self.tau2)
+        if(self.mean is None):
+            self.mean = current_val
+            self.var = 0.0
+            return 0.0, self.mean, 0.0, self.mean_std
+        
+        diff = current_val - self.mean
+        self.mean += alpha * diff
+        self.var = (1.0 - alpha) * (self.var + alpha * diff**2)
+        current_std = np.sqrt(max(0.0,self.var))
+
+        if(self.mean_std is None):
+            self.mean_std = current_std
+        else:
+            diff_std = current_std - self.mean_std
+            self.mean_std += alpha * diff_std
+            self.var_std = (1.0 - alpha2) * (self.var_std + alpha2 * diff**2)
+        std_dev_of_std = np.sqrt(max(0.0,self.var_std))
+
+        return current_std, self.mean ,std_dev_of_std, self.mean_std

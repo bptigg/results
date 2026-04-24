@@ -287,15 +287,92 @@ def plot_peak_decay(data: DataPointCollection, state, group_idx):
     fig,ax = plt.subplots()
     ax.plot(t,y,alpha = 0.4)
     ax.plot(t,upper_env, 'r', linewidth = 2)
+    plt.show(block=False)
+
+def plot_standard_deviation(data: DataPointCollection, state, group_idx, window = 100):
+    indicies = data._index_map[data.unique_groups[group_idx]]
+    t = data.data["Time(ns)"][indicies]
+    y = data.data[state][indicies]
+    num_steps = len(t)
+    
+    ewma = dm.ExponentiallyWeightedMovingAverage(window)
+    std_devs = []
+    std_devs_sig = []
+    means = []
+    means_sig = []
+    for i in range(1,num_steps):
+        dt = t[i]-t[i-1]
+        val = y[i]
+        sigma,mean,sigma_sig, mean_sig = ewma.update(val,dt)
+        std_devs.append(sigma)
+        means.append(mean)
+        means_sig.append(mean_sig)
+        std_devs_sig.append(sigma_sig)
+
+    
+    fig,ax = plt.subplots()
+    t_plot = t[1:num_steps]
+    ax.plot(t_plot,std_devs)
+    ax.plot(t_plot,means)
+    #ax.vlines([window,2*window,3*window,4*window,5*window],[0,0,0,0,0],[1,1,1,1,1])
+    ax.axvspan(0,5*window, color = (117/255,124/255,136/255,0.5))
+    plt.show(block = False)
+
+    fig2,ax2 = plt.subplots()
+    t_plot = t[1:num_steps]
+    ax2.plot(t_plot,std_devs_sig)
+    #ax2.plot(t_plot,means_sig)
+    #ax.vlines([window,2*window,3*window,4*window,5*window],[0,0,0,0,0],[1,1,1,1,1])
+    ax2.axvspan(0,100*window, color = (117/255,124/255,136/255,0.5))
     plt.show()
+    
+    std_devs[0] = np.float64(std_devs[0])
+    std_devs = np.array(std_devs)
+    PeakEnvelopeFit(std_devs,t_plot)
         
+def PeakEnvelopeFit(y_data, t_data):
+    y_data_d = sps.detrend(y_data)
+    y = y_data_d - np.mean(y_data_d)
+    x = t_data
+
+    freq, power = ats.LombScargle(x,y,nterms=1).autopower(method="fastnifty")
+    best_freq = freq[np.argmax(power)]
+    dominant_period = 1 / best_freq
+    avg_peak_distance = dominant_period
+    #
+    peaks, _ = sps.find_peaks(y_data, distance=int(avg_peak_distance * 2))
+    peaks = peaks
+    t_peaks = t_data[peaks]
+    y_peaks = y_data[peaks]
+#
+    envelope_func = spint.interp1d(t_peaks, y_peaks, kind='cubic', fill_value='extrapolate')
+    upper_env = envelope_func(t_data)
+
+    def model_curve(t, A, T, C):
+        return A * np.exp(-t/T) + C
+    intial_guess = [upper_env[0]-upper_env[-1], 1000, upper_env[-1]]
+    start = peaks[0]
+    popt, pcov = spo.curve_fit(model_curve, t_peaks, y_peaks, p0=intial_guess)
+    A_fit, T_fit, C_fit = popt
+    fit = model_curve(t_data, A_fit, T_fit, C_fit)
+
+    fig,ax = plt.subplots()
+    ax.plot(t_data, y_data, alpha=0.4, label='Data')
+    ax.plot(t_data, upper_env, 'r', linewidth=2, label='Peak Envelope')
+    ax.plot(t_peaks, y_peaks, 'kx', label='Peaks')
+    ax.plot(t_data, fit, 'g--', linewidth=2, label=f'Fit: T={T_fit:.2f} ns')
+    plt.xlabel('Time (ns)')
+    plt.ylabel('Standard Deviation')
+    plt.title('Peak Envelope Fit')
+    plt.legend()
+    plt.show()
 
 def main(load : bool = False):
 
     file_name = "NV_centre_N14_GS-T1-3"
     #file_name = "NV_centre_N14_GS-T1-4"
     #file_name = "NV_centre_N14_GS-T1-5"
-    file_name = "NV_centre_N14_GS-T1-11"
+    file_name = "NV_centre_N14_GS-T1-21"
     file_dict = "../GitHub/MolSpin/NV_Centre_N14_results/"
     extension = "-4"
     npzfile = ""
@@ -319,16 +396,18 @@ def main(load : bool = False):
     #plt.show(block = False)
     #plotT2(dat,['gs.t0_u'])#, 'gs.t0_z', 'gs.t0_d'])
     #plt.show()
-    #P,I = find_T1(0,dat,'gs.t0')
-    #print(P[1])
+    P,I = find_T1(0,dat,'gs.t0')
+    print(P[1])
     #plotT1onTimeEvoCurve(0,dat,'gs.t0')
     fft(dat,'gs.t0', 0)
     plot_peak_decay(dat,'gs.t0', 0)
+    plot_standard_deviation(dat,'gs.t0', 0,100)
+    #peak_
 
 
     t,sol = rate_kinetics(kinetics)
 
-    plot_kinetics(states[0] + states[1] + states[2])
+    #plot_kinetics(states[0] + states[1] + states[2])
 
 
 if __name__ == "__main__":
