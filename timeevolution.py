@@ -11,7 +11,17 @@ from scipy import optimize as spo
 from scipy import integrate as spi
 from scipy import signal as sps
 from scipy import interpolate as spint
-import nifty_ls
+import torch
+from scipy import ndimage as spd
+#from scipy.ndimage import maximum_filter1d
+
+CUDA = False
+if torch.cuda.is_available():
+    try:
+        import nifty_ls
+        CUDA = True
+    except:
+        CUDA = False
 from astropy import timeseries as ats
 
 #per ns
@@ -132,7 +142,10 @@ def lombscargle2(t,y):
     y_centre = y - np.mean(y)
     pgram = []
     freqs = []
-    freq, power = ats.LombScargle(t,y,nterms=1).autopower(method="fastnifty")
+    if CUDA:
+        freq, power = ats.LombScargle(t,y,nterms=1).autopower(method="fastnifty")
+    else:
+        freq, power = ats.LombScargle(t,y,nterms=1).autopower()
     #for i in range(5):
     #    freq_i = np.linspace(i, i+1, 1000)
     #    pgram_ = #sps.lombscargle(t,y_centre, freq_i*2*np.pi)
@@ -335,7 +348,10 @@ def PeakEnvelopeFit(y_data, t_data):
     y = y_data_d - np.mean(y_data_d)
     x = t_data
 
-    freq, power = ats.LombScargle(x,y,nterms=1).autopower(method="fastnifty")
+    if CUDA:
+        freq, power = ats.LombScargle(x,y,nterms=1).autopower(method="fastnifty")
+    else:
+        freq, power = ats.LombScargle(x,y,nterms=1).autopower()
     best_freq = freq[np.argmax(power)]
     dominant_period = 1 / best_freq
     avg_peak_distance = dominant_period
@@ -344,23 +360,38 @@ def PeakEnvelopeFit(y_data, t_data):
     peaks = peaks
     t_peaks = t_data[peaks]
     y_peaks = y_data[peaks]
-#
+
+    peaks2, _  = sps.find_peaks(y_peaks, distance = 1, prominence = 0.01)
+    t_peaks_2 = t_peaks[peaks2]
+    y_peaks_2 = y_peaks[peaks2]
+
+    windows_size = 4
+    y_summits= spd.maximum_filter1d(y_peaks_2,size=windows_size)
+
     envelope_func = spint.interp1d(t_peaks, y_peaks, kind='cubic', fill_value='extrapolate')
     upper_env = envelope_func(t_data)
 
     def model_curve(t, A, T, C):
         return A * np.exp(-t/T) + C
-    intial_guess = [upper_env[0]-upper_env[-1], 1000, upper_env[-1]]
-    start = peaks[0]
-    popt, pcov = spo.curve_fit(model_curve, t_peaks, y_peaks, p0=intial_guess)
-    A_fit, T_fit, C_fit = popt
-    fit = model_curve(t_data, A_fit, T_fit, C_fit)
+    
+
+    intial_guess = [y_summits[0], 1000, 0]
+    popt_top, _ = spo.curve_fit(model_curve, t_peaks_2, y_summits, p0=intial_guess)
+    fit_line_top = model_curve(t_data, *popt_top)
+    A_fit, T_fit, C_fit = popt_top
+
+
+    #start = peaks[0]
+    #popt, pcov = spo.curve_fit(model_curve, t_peaks_2, y_peaks_2, p0=intial_guess)
+    #A_fit, T_fit, C_fit = popt
+    #fit = model_curve(t_data, A_fit, T_fit, C_fit)
 
     fig,ax = plt.subplots()
     ax.plot(t_data, y_data, alpha=0.4, label='Data')
     ax.plot(t_data, upper_env, 'r', linewidth=2, label='Peak Envelope')
-    ax.plot(t_peaks, y_peaks, 'kx', label='Peaks')
-    ax.plot(t_data, fit, 'g--', linewidth=2, label=f'Fit: T={T_fit:.2f} ns')
+    ax.plot(t_peaks_2, y_peaks_2, 'kx', label='Peaks')
+    #ax.plot(t_data, fit, 'g--', linewidth=2, label=f'Fit: T={T_fit:.2f} ns')
+    ax.plot(t_data, fit_line_top, 'b--', linewidth=2, label=f'Fit: T={T_fit:.2f} ns')
     plt.xlabel('Time (ns)')
     plt.ylabel('Standard Deviation')
     plt.title('Peak Envelope Fit')
@@ -372,13 +403,17 @@ def main(load : bool = False):
     file_name = "NV_centre_N14_GS-T1-3"
     #file_name = "NV_centre_N14_GS-T1-4"
     #file_name = "NV_centre_N14_GS-T1-5"
-    file_name = "NV_centre_N14_GS-T1-21"
+    file_name = "NV_centre_N14_GS-T1-22"
+    #file_name = "NV_centre_N14_GS-T1-22"
     file_dict = "../GitHub/MolSpin/NV_Centre_N14_results/"
-    extension = "-4"
+    file_dict_ssh = "Documents/GitHub/MolSpin/NV_Centre_N14_results/"
+    #extension = "-4"
+    extension = ""
     npzfile = ""
     file = file_dict + file_name# + extension
     if(not load):
-        npzfile = dm.ProcessFile(file,file_name+extension)
+        #npzfile = dm.ProcessFile(file,file_name+extension)
+        npzfile = dm.ProcessFileSSH(file_name, file_name,file_dict_ssh,"scandium.qbl.uni-oldenburg.de","juft2450")
     else:
         npzfile = file + ".npz"
     #dat = DataPointCollection(npzfile)
@@ -396,12 +431,12 @@ def main(load : bool = False):
     #plt.show(block = False)
     #plotT2(dat,['gs.t0_u'])#, 'gs.t0_z', 'gs.t0_d'])
     #plt.show()
-    P,I = find_T1(0,dat,'gs.t0')
-    print(P[1])
+    #P,I = find_T1(0,dat,'gs.t0')
+    #print(P[1])
     #plotT1onTimeEvoCurve(0,dat,'gs.t0')
-    fft(dat,'gs.t0', 0)
-    plot_peak_decay(dat,'gs.t0', 0)
-    plot_standard_deviation(dat,'gs.t0', 0,100)
+    #fft(dat,'gs.t0', 0)
+    #plot_peak_decay(dat,'gs.t0', 0)
+    plot_standard_deviation(dat[0:int(len(dat)/4)],'gs.t0', 0,100)
     #peak_
 
 
@@ -411,5 +446,5 @@ def main(load : bool = False):
 
 
 if __name__ == "__main__":
-    main()
-    #main(True)
+    #main()
+    main(True)

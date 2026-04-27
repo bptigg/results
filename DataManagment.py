@@ -7,6 +7,8 @@ import threading
 import paramiko
 import io
 import socket
+import sys
+import logging
 
 class DataPointCollection:
     def __init__(self,filename,_internal_data=None,_internal_groups=None, _internal_indices=None):
@@ -43,8 +45,11 @@ class DataPointCollection:
 
         self.last_accessed_group = 0
         self.start_background_processing(lookahead=20)
-        
+
+#need to make a method that is able to slice the data of every group
     def __len__(self):
+        if self.num_groups == 1:
+            return len(self.active_indices)
         return self.num_groups
     def __getitem__(self, key):
         if isinstance(key, slice):
@@ -53,26 +58,45 @@ class DataPointCollection:
                 new_indices = np.concatenate([self._index_map[group_id] for group_id in selected_groups])
                 #new_groups = self._group_map[mask]
                 return DataPointCollection(None, _internal_data=self.data, _internal_groups=self._group_map, _internal_indices=new_indices)
+            elif self.num_groups == 1:
+                selected_groups = self.unique_groups[0]
+                new_indices = self._index_map[selected_groups][key]
+                return DataPointCollection(
+                None, 
+                _internal_data=self.data, 
+                _internal_groups=self._group_map, 
+                _internal_indices=np.array(new_indices)
+                )
             else:
                 raise ValueError("Slicing is only supported for collections with a single group or when derivative is False.")
         if isinstance(key, tuple):
             if len(key) != 2:
                 raise ValueError("Tuple key must have exactly two elements: (group_slice, data_slice).")
             group_idx, data_slice = key
-            if isinstance(group_idx, int) and isinstance(data_slice, slice):
+            if isinstance(group_idx, int):
                 if group_idx >= self.num_groups:
                     raise IndexError("Group index out of range.")
+                selected_groups = [self.unique_groups[group_idx]]
                 self.last_accessed_group = group_idx
-                group_id = self.unique_groups[group_idx]
-                indices = self._index_map[group_id]
-                sliced_indices = indices[data_slice]
-                return DataPointCollection(None, _internal_data=self.data, _internal_groups=self._group_map, _internal_indices=sliced_indices)
-            if isinstance(group_idx, slice) and isinstance(data_slice, slice):
+            elif isinstance(group_idx, slice):
+                g_start, g_stop, g_step = group_idx.indices(self.num_groups)
+                if g_stop >= self.num_groups+1:
+                    raise IndexError("Group index out of range.")
                 selected_groups = self.unique_groups[group_idx]
-                new_indices = []
-                for g_id in selected_groups:
-                    new_indices.extend(self._index_map[g_id][data_slice])
-                return DataPointCollection(None,_internal_data = self.data, _internal_groups = self._group_map, _internal_indices = np.array(new_indices))
+            else:
+                raise TypeError("Group index must be int or slice")
+            new_indices = []
+            for g_id in selected_groups:
+                group_indices = self._index_map[g_id]
+                new_indices.extend(group_indices[data_slice])
+            
+            return DataPointCollection(
+                None, 
+                _internal_data=self.data, 
+                _internal_groups=self._group_map, 
+                _internal_indices=np.array(new_indices)
+            )
+        
         if key >= self.num_groups:
             raise IndexError("Group index out of range.")
         if isinstance(key, int):
@@ -146,12 +170,31 @@ class DataView:
              
 
 def read_file(filename):
+    stats = {'last_bytes': 0, 'last_time': time.time(), 'current_speed': 0.0}
+    
+    def update_ui(current_bytes, total_bytes):
+        current_time = time.time()
+        time_diff = current_time - stats['last_time']
+        if time_diff >= 0.5:
+            bytes_diff = current_bytes - stats['last_bytes']
+            stats['current_speed'] = (bytes_diff / (1024**2)) / time_diff
+            stats['last_bytes'] = current_bytes
+            stats['last_time'] = current_time
+            
+            percent = (current_bytes / total_bytes) * 100
+            msg = f"\rParsing Data: {percent:5.1f}% | Speed: {stats['current_speed']:6.2f} MB/s"
+            sys.stdout.write(msg)
+            sys.stdout.flush()
     if isinstance(filename,str):
+        filesize = os.path.getsize(filename)
         with open(filename, "rb") as f:
             with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
                 lines = []
                 for line in iter(mm.readline, b""):
                     lines.append(line.decode('utf-8').split())
+                    if len(lines) % 1000 == 0:
+                        update_ui(mm.tell(), filesize)
+                print()
                 return lines
     elif isinstance(filename,io.BytesIO):
         lines = []
@@ -208,26 +251,93 @@ def ProcessFile(filenames,new_filenames = [""]):
         print("Error: No valid data rows were found in the files.")
         return None
 
+def enroll_ssh_key(ssh_client, key_path):
+    if not os.path.exists(key_path):
+        print(f"Generating new RSA key at {key_path}...")
+        key = paramiko.RSAKey.generate(2048)
+        key.write_private_key_file(key_path)
+    else:
+        key = paramiko.RSAKey.from_private_key_file(key_path)
 
-def ProcessFileSSH(filename, new_filename = "", dict_path = "",host = "", user = "", password = None, key_path = None):
+    public_key_str = f"{key.get_name()} {key.get_base64()}"
+    
+    # Ensure remote .ssh directory exists and append the public key
+    setup_cmd = f'mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo "{public_key_str}" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+    stdin, stdout, stderr = ssh_client.exec_command(setup_cmd)
+    
+    if stdout.channel.recv_exit_status() == 0:
+        print("Successfully enrolled local key on the remote server.")
+        return True
+    return False
+
+
+def ProcessFileSSH(filename, new_filename = "", dict_path = "",host = "", user = "", password = None, key_path = "~/.ssh/id_rsa_generated"):
     ssh = paramiko.SSHClient()
-    ssh.load_system_host_keys()
+    known_hosts_path = os.path.expanduser("~/.ssh/known_hosts")
+    os.makedirs(os.path.dirname(known_hosts_path), exist_ok=True)
+    if(os.path.exists(known_hosts_path)):
+        ssh.load_system_host_keys()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    full_key_path = os.path.expanduser(key_path)
+    logging.basicConfig(level=logging.WARNING)
     try:
-        ssh.connect(hostname=host, username=user, password=password,key_filename=key_path,look_for_keys=True,timeout=20)
-        print("connected")
+        try:
+            my_key = paramiko.RSAKey.from_private_key_file(full_key_path)
+            ssh.connect(hostname=host, username=user, pkey=my_key, look_for_keys=False, allow_agent=False, timeout=20)
+            #ssh.connect(hostname=host, username=user, key_filename=key_path,look_for_keys=False,allow_agent=False,timeout=20)
+            print(f"Connected to {host} via SSH Key.")
+        except (paramiko.AuthenticationException, paramiko.SSHException, FileNotFoundError):
+            if password:
+                print("Key auth failed. Attempting password login and key enrollment...")
+                ssh.connect(hostname=host, username=user, password=password, timeout=15)
+                
+                ssh.save_host_keys(known_hosts_path)
+                enroll_ssh_key(ssh, full_key_path)
+            else:
+                print("No valid key found and no password provided.")
+                return False
         with ssh.open_sftp() as sftp:
             if(new_filename == ""):
                 new_filename = filename
             remote_path = filename + ".dat"
             file_buffer = io.BytesIO()
-            #print(sftp.listdir('.'))
+            print(sftp.listdir('.'))
             if(dict_path):
                 sftp.chdir(dict_path)
-            sftp.getfo(remotepath=remote_path,fl=file_buffer)
+
+            start = time.time()
+            stats = {
+                'last bytes' : 0,
+                'last time' : start,
+                'current speed' : 0.0
+            }
+
+            def ProgressStats(transferred, total):
+                currenttime = time.time()
+                time_diff = currenttime - stats['last time']
+                if time_diff >= 1.0:
+                    bytes_diff = transferred - stats['last bytes']
+                    stats['current speed'] = (bytes_diff / (1024**2)) / time_diff
+                    stats['last bytes'] = transferred
+                    stats['last time'] = currenttime
+                percent = (transferred / total) * 100
+                done_mb = transferred / (1024**2)
+                total_mb = total / (1024**2)
+                msg = f"\rProgress: {percent:5.1f}% | Speed: {stats['current speed']:6.2f} MB/s | {done_mb:7.1f}/{total_mb:.1f} MB"
+                sys.stdout.write(msg)
+                sys.stdout.flush()
+
+            sftp.getfo(remotepath=remote_path,fl=file_buffer,callback=ProgressStats)
+            print()
+            time_diff = time.time() - start
+            mins,secs = divmod(int(time_diff),60)
+            msg = f"\rTotal time: {mins}m:{secs}s"
+            sys.stdout.write(msg)
+            sys.stdout.flush()
             file_buffer.seek(0)
             data = read_file(file_buffer)
-            save_data_npz(data, new_filename)
+            headers = data[0]
+            save_data_npz(headers, np.array(data[1:]), new_filename)
             return new_filename + ".npz", True
     except paramiko.AuthenticationException:
         print("Error: Authentication failed. Please check your username/password.")
@@ -245,8 +355,6 @@ def ProcessFileSSH(filename, new_filename = "", dict_path = "",host = "", user =
 
     print("Script will open npz file of same name, if this is not the first time it has been run")
     return False
-
-
 
 
 class ExponentiallyWeightedMovingAverage:
