@@ -339,9 +339,9 @@ def plot_standard_deviation(data: DataPointCollection, state, group_idx, window 
     ax2.axvspan(0,100*window, color = (117/255,124/255,136/255,0.5))
     plt.show()
     
-    std_devs[0] = np.float64(std_devs[0])
-    std_devs = np.array(std_devs)
-    PeakEnvelopeFit(std_devs,t_plot)
+    #std_devs[0] = np.float64(std_devs[0])
+    #std_devs = np.array(std_devs)
+    #PeakEnvelopeFit(std_devs,t_plot)
         
 def PeakEnvelopeFit(y_data, t_data):
     y_data_d = sps.detrend(y_data)
@@ -400,20 +400,28 @@ def PeakEnvelopeFit(y_data, t_data):
 
 def main(load : bool = False):
 
-    file_name = "NV_centre_N14_GS-T1-3"
+    #base_path = "../GitHub/MolSpin/NV_Centre_N14_results/"
+    #base_file_name = "NV_centre_N14_GS-T"
+    #base_file = base_path + base_file_name
+    #dm.BatchProcess(base_file_name, 0,2, base_path=base_path)
+   # return
+
+    #file_name = "NV_centre_N14_GS-T1-3"
     #file_name = "NV_centre_N14_GS-T1-4"
     #file_name = "NV_centre_N14_GS-T1-5"
-    file_name = "NV_centre_N14_GS-T1-22"
+    #file_name = "NV_centre_N14_GS-T1-29"
     #file_name = "NV_centre_N14_GS-T1-22"
-    file_dict = "../GitHub/MolSpin/NV_Centre_N14_results/"
-    file_dict_ssh = "Documents/GitHub/MolSpin/NV_Centre_N14_results/"
+    file_name = "NV_centre_N14_GS-T-"
+    #file_dict = "../GitHub/MolSpin/NV_Centre_N14_results/"
+    #file_dict_ssh = "Documents/GitHub/MolSpin/NV_Centre_N14_results/"
     #extension = "-4"
-    extension = ""
+    extension = "3"
     npzfile = ""
-    file = file_dict + file_name# + extension
+    #file = file_dict + file_name# + extension
+    file = file_name + extension
     if(not load):
-        #npzfile = dm.ProcessFile(file,file_name+extension)
-        npzfile = dm.ProcessFileSSH(file_name, file_name,file_dict_ssh,"scandium.qbl.uni-oldenburg.de","juft2450")
+        npzfile = dm.ProcessFile(file,file_name+extension)
+        #npzfile = dm.ProcessFileSSH(file_name, file_name,file_dict_ssh,"scandium.qbl.uni-oldenburg.de","juft2450")
     else:
         npzfile = file + ".npz"
     #dat = DataPointCollection(npzfile)
@@ -422,7 +430,7 @@ def main(load : bool = False):
     states = [['gs.t0_u', 'gs.t0_z', 'gs.t0_d', 'gs.tp_u', 'gs.tp_z', 'gs.tp_d', 'gs.td_u', 'gs.td_z', 'gs.td_d'],
               ['es.t0_u', 'es.t0_z', 'es.t0_d', 'es.tp_u', 'es.tp_z', 'es.tp_d', 'es.td_u', 'es.td_z', 'es.td_d'],
               ['ms.i'] ]
-    #plotTimeEvolution(0,dat,['gs.t0'])
+    plotTimeEvolution(0,dat,['gs.t0'])
     #plotTimeEvolution(50,dat,states[0])
     #plotTimeEvolution(92,dat,states[0])
     #plt.show(block = False)
@@ -436,7 +444,8 @@ def main(load : bool = False):
     #plotT1onTimeEvoCurve(0,dat,'gs.t0')
     #fft(dat,'gs.t0', 0)
     #plot_peak_decay(dat,'gs.t0', 0)
-    plot_standard_deviation(dat[0:int(len(dat)/4)],'gs.t0', 0,100)
+    #plot_standard_deviation(dat[0:int(len(dat)/4)],'gs.t0', 0,100)
+    plot_standard_deviation(dat,'gs.t0', 0,100)
     #peak_
 
 

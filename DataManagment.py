@@ -10,43 +10,65 @@ import socket
 import sys
 import logging
 
+
 class DataPointCollection:
-    def __init__(self,filename,_internal_data=None,_internal_groups=None, _internal_indices=None):
-        if _internal_data is not None:
-            self.data = _internal_data
-            self._group_map = _internal_groups
+    #def __init__(self,filename,_internal_data=None,_internal_groups=None, _internal_indices=None):
+    def __init__(self, filenames=None, _internal_state=None):
+        if _internal_state is not None:
+            self.files = _internal_state['files']
+            self._group_map = _internal_state['group_map']
+            self.active_indices = _internal_state['indicies']
+            self.file_row_offsets = _internal_state['row_offsets']
+            self.cached_keys = _internal_state['keys']
             self.derivative = True
-            self.active_indices = _internal_indices
-            self.cached_keys = []
         else:
-            with open(filename, "rb") as f:
-                with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
-                    try:
-                        os.madvise(mm, mmap.MADV_WILLNEED)
-                        os.madvise(mm, mmap.MADV_SEQUENTIAL)
-                    except (AttributeError, OSError):
-                        pass
-            self.data = np.load(filename, allow_pickle=True, mmap_mode='r')
-            self._group_map = self.data['_group_map']
+            self.files = []
+            self.file_row_offsets = [0]
+            self.derivative = False
+            global_group_map = []
+            current_group_offset= 0
+            if(isinstance(filenames, str)):
+                filenames = [filenames]
+            for filename in filenames:
+                self._mmap_warm(filename)
+                data = np.load(filename, allow_pickle=True, mmap_mode='r')
+                self.files.append(data)
+                local_groups = data['_group_map']
+                offset_groups = local_groups + current_group_offset
+                global_group_map.append(offset_groups)
+                current_group_offset = offset_groups.max() + 1
+                self.file_row_offsets.append(self.file_row_offsets[-1] + len(local_groups))
+            self._group_map = np.concatenate(global_group_map)
             self.derivative = False
             self.active_indices = np.arange(len(self._group_map))
         
-            self.cached_keys = [k for k in self.data.files if k != '_group_map']
+            self.cached_keys = [k for k in self.files[0].files if k != '_group_map']
         
         self._index_map = defaultdict(list)
         for idx in self.active_indices:
-            group_id = self._group_map[idx]
-            self._index_map[group_id].append(idx)
+            self._index_map[self._group_map[idx]].append(idx)
         for group_id in self._index_map:
             self._index_map[group_id] = np.array(self._index_map[group_id])
 
-        self.unique_groups = list(self._index_map.keys())
+        self.unique_groups = sorted(list(self._index_map.keys()))
         self.num_groups = len(self.unique_groups)
 
         self.last_accessed_group = 0
         self.start_background_processing(lookahead=20)
 
-#need to make a method that is able to slice the data of every group
+    def _mmap_warm(self, filename):
+        try:
+            with open(filename, "rb") as f:
+                with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
+                    os.madvise(mm, mmap.MADV_WILLNEED)
+                    os.madvise(mm, mmap.MADV_SEQUENTIAL)
+        except(AttributeError,OSError,ValueError):
+            pass
+    def _get_data_from_global_idx(self, key, global_idx):
+        file_idx = np.searchsorted(self.file_row_offsets, global_idx, side='right') -1
+        local_idx = global_idx - self.file_row_offsets[file_idx]
+        return self.files[file_idx][key][local_idx]
+
     def __len__(self):
         if self.num_groups == 1:
             return len(self.active_indices)
@@ -56,19 +78,19 @@ class DataPointCollection:
             if not self.derivative and self.num_groups != 1:
                 selected_groups = self.unique_groups[key]
                 new_indices = np.concatenate([self._index_map[group_id] for group_id in selected_groups])
-                #new_groups = self._group_map[mask]
-                return DataPointCollection(None, _internal_data=self.data, _internal_groups=self._group_map, _internal_indices=new_indices)
             elif self.num_groups == 1:
                 selected_groups = self.unique_groups[0]
                 new_indices = self._index_map[selected_groups][key]
-                return DataPointCollection(
-                None, 
-                _internal_data=self.data, 
-                _internal_groups=self._group_map, 
-                _internal_indices=np.array(new_indices)
-                )
             else:
                 raise ValueError("Slicing is only supported for collections with a single group or when derivative is False.")
+            state = {
+                'files' : self.files,
+                'group_map' : self._group_map,
+                'indices' : np.array(new_indices),
+                'row_offsets' : self.file_row_offsets,
+                'keys' : self.cached_keys
+            }
+            return DataPointCollection(_internal_state = state)
         if isinstance(key, tuple):
             if len(key) != 2:
                 raise ValueError("Tuple key must have exactly two elements: (group_slice, data_slice).")
@@ -90,23 +112,26 @@ class DataPointCollection:
                 group_indices = self._index_map[g_id]
                 new_indices.extend(group_indices[data_slice])
             
-            return DataPointCollection(
-                None, 
-                _internal_data=self.data, 
-                _internal_groups=self._group_map, 
-                _internal_indices=np.array(new_indices)
-            )
+            state = {
+                'files' : self.files,
+                'group_map' : self._group_map,
+                'indices' : np.array(new_indices),
+                'row_offsets' : self.file_row_offsets,
+                'keys' : self.cached_keys
+            }
+
+            return DataPointCollection(_internal_state = state)
         
-        if key >= self.num_groups:
-            raise IndexError("Group index out of range.")
         if isinstance(key, int):
+            if key >= self.num_groups:
+                raise IndexError("Group index out of range.")
             self.last_accessed_group = key
             group_id = self.unique_groups[key]
             indices = self._index_map[group_id]
             return [DataView(self.data, self.GetKeys(), i) for i in indices]
     def UniqueHeaders(self):
         #current_headers = self.data["Header"][np.isin(range(len(self.data["Header"])), self.active_indices)]
-        current_headers = self.data["Header"][self.active_indices]
+        current_headers = [self._get_data_from_global_idx("Header",idx) for idx in self.active_indices]
         num = len(np.unique(current_headers))
         return [num for _ in range(len(self))]
     def __iter__(self):
@@ -138,27 +163,31 @@ class DataPointCollection:
     def warm_group(self, group_idx):
         group_id = self.unique_groups[group_idx]
         indices = self._index_map[group_id]
-        for key in self.cached_keys:
-            _ = self.data[key][indices]
-
-        
+        for idx in indices:
+            f_idx = np.searchsorted(self.file_row_offsets, idx, side='right') - 1
+            local_idx = idx - self.file_row_offsets[f_idx]
+            for key in self.cached_keys:
+                _ = self.files[f_idx][key][local_idx]
 
 class DataView:
 
     __slots__ = ['master', 'i', 'keys', '_cache']
 
-    def __init__(self, master_collection,keys, index):
+    def __init__(self, master_collection : DataPointCollection,keys, index):
         self.master = master_collection
         self.i = index
         self.keys = keys
         self._cache = {}
+
+    def __getitem__(self, key):
+        return self.master._get_data_from_global_idx(key, self.i)
 
     def __getattr__(self, name):
         if name in self._cache:
             return self._cache[name]
         
         if name in self.keys:
-            val = self.master[name][self.i]
+            val = self.master._get_data_from_global_idx(name, self.i)
             if hasattr(val,'item') and not isinstance(val, np.ndarray):
                 val = val.item()
             self._cache[name] = val
@@ -166,7 +195,11 @@ class DataView:
         raise AttributeError(f"'DataView' object has no attribute '{name}'")
     
     def __repr__(self):
-        return f"<DataView index={self.i} header={self.Header}>"
+        try:
+            header_val = self.Header
+        except AttributeError:
+            header_val = "Unkown"
+        return f"<DataView index={self.i} header={header_val}>"
              
 
 def read_file(filename):
@@ -202,6 +235,27 @@ def read_file(filename):
             lines.append(line.decode('utf-8').split())
         return lines
 
+def peak_to_end_of_file(filename):
+    with open(filename, 'r+b') as f:
+        try:
+            f.seek(0, os.SEEK_END)
+            pointer = f.tell()
+            buffer = b""
+            while pointer > 0:
+                pointer -= 1
+                f.seek(pointer)
+                char = f.read(1)
+                if char == b'\n' and buffer:
+                    break
+                buffer = char + buffer
+            return buffer.decode('utf-8').strip()
+        except OSError:
+            return None
+        
+#def concatinate_multiple_npz_files(base_file, start_idx, end_idx):
+    
+
+
         
 def save_data_npz(header_names,lines, filename):
     #header_names = lines[0]
@@ -209,6 +263,13 @@ def save_data_npz(header_names,lines, filename):
     save_dict = {}
     save_dict['_group_map'] = data_rows[:,0]
     for i,name in enumerate(header_names):
+        percent = int(((i+1) / len(header_names)) * 100)
+        bar_length = 20
+        filled_length = int(bar_length * (i+1) // len(header_names))
+        bar = '█' * filled_length + '-' * (bar_length - filled_length)
+        sys.stdout.write(f"\rSaving Data: |{bar}| {percent}% ({name[:15]})")
+        sys.stdout.flush()
+
         if i == 0: continue
         col_data = data_rows[:,i]
         try:
@@ -217,6 +278,38 @@ def save_data_npz(header_names,lines, filename):
             save_dict[name] = col_data
     np.savez(filename, **save_dict)
     print(f"Saved {filename} to .npz file")
+
+def BatchProcess(base_file, idx_start, idx_end, new_base_filename = "", base_path = ""):
+    filenames = []
+    new_filenames = []
+    for i in range(idx_start, idx_end+1):
+        base_filename = ""
+        if base_path:
+            base_filename = os.path.join(base_path, base_file)
+        else:
+            base_filename = base_file
+        filenames.append(f"{base_filename}-{i}")
+        if new_base_filename:
+            new_filenames.append(f"{new_base_filename}-{i}")
+        else:
+            new_filenames.append(base_file + f"-{i}")
+    BatchProcessFiles(filenames, new_filenames)
+
+def BatchProcessFiles(filenames, new_filenames = [""]):
+    if isinstance(filenames, str):
+        filenames = [filenames]
+    if isinstance(new_filenames, str):
+        new_filenames = [new_filenames]
+    if len(new_filenames) == 1 and new_filenames[0] == "":
+        new_filenames = [filenames[i] for i in range(len(filenames))]
+    for i, fname in enumerate(filenames):
+        f = fname + ".dat"
+        lines = read_file(f)
+        if not lines:
+            print(f"Warning: File {f} is empty or could not be read.")
+            continue
+        header_names = lines[0]
+        save_data_npz(header_names, lines[1:], new_filenames[i])
 
 def ProcessFile(filenames,new_filenames = [""]):
     if isinstance(filenames, str):
