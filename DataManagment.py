@@ -33,7 +33,11 @@ class DataPointCollection:
                 self._mmap_warm(filename)
                 data = np.load(filename, allow_pickle=True, mmap_mode='r')
                 self.files.append(data)
-                local_groups = data['_group_map']
+                local_groups_raw = data['_group_map']
+                try:
+                    local_groups = local_groups_raw.astype('int64')
+                except ValueError:
+                    _, local_groups = np.unique(local_groups_raw, return_inverse=True)
                 offset_groups = local_groups + current_group_offset
                 global_group_map.append(offset_groups)
                 current_group_offset = offset_groups.max() + 1
@@ -65,10 +69,17 @@ class DataPointCollection:
         except(AttributeError,OSError,ValueError):
             pass
     def _get_data_from_global_idx(self, key, global_idx):
+        if len(self.files) == 1:
+            return self.files[0][key][global_idx]
+        global_idx = int(global_idx)
         file_idx = np.searchsorted(self.file_row_offsets, global_idx, side='right') -1
         local_idx = global_idx - self.file_row_offsets[file_idx]
         return self.files[file_idx][key][local_idx]
-
+    
+    @property
+    def data(self):
+        return MultiFileProxy(self)
+    
     def __len__(self):
         if self.num_groups == 1:
             return len(self.active_indices)
@@ -251,7 +262,24 @@ def peak_to_end_of_file(filename):
             return buffer.decode('utf-8').strip()
         except OSError:
             return None
-        
+
+class MultiFileProxy:
+    def __init__(self, master):
+        self.master = master
+    def __getitem__(self, key):
+        return KeyProxy(self.master, key)
+
+class KeyProxy:
+    def __init__(self,master : DataPointCollection, key):
+        self.master =  master
+        self.key = key
+    def __getitem__(self, indices):
+        if isinstance(indices, int):
+            return self.master._get_data_from_global_idx(self.key, indices)
+        if(len(self.master.files)) == 1:
+            return self.master.files[0][self.key][indices]
+        return np.array([self.master._get_data_from_global_idx(self.key, idx) for idx in indices])
+
 #def concatinate_multiple_npz_files(base_file, start_idx, end_idx):
     
 

@@ -13,6 +13,7 @@ from scipy import signal as sps
 from scipy import interpolate as spint
 import torch
 from scipy import ndimage as spd
+from functools import partial
 #from scipy.ndimage import maximum_filter1d
 
 CUDA = False
@@ -47,6 +48,9 @@ mapping = {
 def plotTimeEvolution(group_id : int, data : DataPointCollection, states : list):
     indicies = data._index_map[data.unique_groups[group_id]]
     time = data.data['Time(ns)'][indicies]
+    strain_mod = data.data['gs.strain_modulated.ex'][indicies][0]
+    strain = data.data['gs.strain.ex'][indicies][0]
+    #strain_string = rf"${strain} \pm {strain_mod}$"
     
     figure,ax = plt.subplots()
 
@@ -55,6 +59,7 @@ def plotTimeEvolution(group_id : int, data : DataPointCollection, states : list)
         plt.plot(time,signal,label=state)
     plt.xlabel('Time (ns)')
     plt.ylabel('State population')
+    #plt.title(rf"Time evoluation of the ground state with a broadband strain modulation of ${strain_string}$")
     plt.legend()
     plt.draw()
 
@@ -155,121 +160,6 @@ def lombscargle2(t,y):
     return freq, power
 
 
-def t1_curve(t, A, T1, C):
-    return A * np.exp(-t/T1) + C
-
-#def t1_curve(t, T1):
-#    return 2/3 * np.exp(-t/T1) + 1/3
-
-def find_T1(group_id : int, data : DataPointCollection, state, indicies = []):
-    if(len(indicies) == 0):
-        indicies = data._index_map[data.unique_groups[group_id]]
-    t_data = data.data['Time(ns)'][indicies]
-    y_data = data.data[state][indicies]
-
-    window_size = 1000
-    y_smoothed = y_data #np.convolve(y_data,np.ones(window_size)/window_size, mode='same')
-
-    start_idx = 0# len(t_data) 
-    t_fit = t_data[start_idx::]
-    y_fit = y_smoothed[start_idx::]
-    p0 = [2/3, 1e5, 1/3]
-    #p0 = [1e5]
-    popt, _ = spo.curve_fit(t1_curve, t_fit, y_fit, p0=p0)
-    return popt,indicies
-
-def t2_curve(t, A, T2, f, phi, C):
-    return A * np.exp(-t/T2) * np.cos(2 * np.pi * f * t + phi) + C
-
-def find_T2(group_id, data, state, indicies = []):
-    if(len(indicies) == 0):
-        indicies = data._index_map[data.unique_groups[group_id]]
-    t_data = data.data['Time(ns)'][indicies]
-    y_data = data.data[state][indicies]
-    f = lombscargle(t_data,y_data)
-    p0 = [np.ptp(y_data)/2, 200, f, 0, np.mean(y_data)]
-    try:
-        popt, _ = spo.curve_fit(t2_curve, t_data, y_data, p0=p0)
-    except RuntimeWarning, spo.OptimizeWarning, RuntimeError:
-        popt = p0
-    return popt,indicies
-
-
-def getTtimes(group_id : int, data : DataPointCollection, states : list, find = [1,0]):
-    indicies = data._index_map[data.unique_groups[group_id]]
-    t1 = []
-    t2 = []
-    for s in states:
-        if(find[0]):
-            p,i = find_T1(group_id=group_id, data = data, state = s, indicies=indicies)
-            t1.append(p[1])
-        if(find[1]):
-            p,i = find_T2(group_id=group_id, data = data, state = s, indicies=indicies)
-            t2.append(p[1])
-    return [t1,t2]
-
-def plotT1(data : DataPointCollection, states, x_coord = "gs.zeeman.field.length"):
-    num_groups = len(data.unique_groups)
-    #num_groups = 40
-    T1 = []
-    x = []
-    for i in range(num_groups):
-        indicies = data._index_map[data.unique_groups[i]]
-        t = getTtimes(i,data,states,[1,0])[0]
-        T1.append(t)
-        x.append(data.data[x_coord][indicies][0])
-
-    y = [[t1[i] for t1 in T1] for i in range(len(states))]
-    
-    fig,ax = plt.subplots()
-    for i in range(len(states)):
-        ax.plot(x,y[i], label = states[i])
-    plt.legend()
-    plt.draw()
-
-def plotT1onTimeEvoCurve(group_id: int, data: DataPointCollection, state: str):
-    popt, indicies = find_T1(group_id, data, state)
-    #A, T1, C = popt
-    
-    t_data = data.data['Time(ns)'][indicies]
-    y_data = data.data[state][indicies]
-    
-    plt.figure(figsize=(8, 5))
-    plt.scatter(t_data, y_data, s=10, label=f"Data ({state})", alpha=0.5)
-    
-    t_fit = np.linspace(min(t_data), max(t_data), 500)
-    y_fit = t1_curve(t_fit, *popt)
-    T1 = popt[1]
-    print(T1)
-    
-    plt.plot(t_fit, y_fit, color='red', linewidth=2, 
-             label=r'Fit: $T_1$={T1:.2e} ns\n$y = A \cdot e^{{-t/T_1}} + C$')
-    
-    plt.xlabel('Time (ns)')
-    plt.ylabel('Population')
-    plt.title(f'T1 Relaxation Fit - Group {group_id}')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show(block = False)
-
-def plotT2(data : DataPointCollection, states, x_coord = "gs.zeeman.field.length"):
-    num_groups = len(data.unique_groups)
-    #num_groups = 40
-    T1 = []
-    x = []
-    for i in range(num_groups):
-        indicies = data._index_map[data.unique_groups[i]]
-        t = getTtimes(i,data,states,[0,1])[1]
-        T1.append(t)
-        x.append(data.data[x_coord][indicies][0])
-
-    y = [[t1[i] for t1 in T1] for i in range(len(states))]
-    
-    fig,ax = plt.subplots()
-    for i in range(len(states)):
-        ax.plot(x,y[i], label = states[i])
-    plt.legend()
-    plt.draw()
 
 def fft(data : DataPointCollection, state, group_idx):
     indicies = data._index_map[data.unique_groups[group_idx]]
@@ -325,23 +215,103 @@ def plot_standard_deviation(data: DataPointCollection, state, group_idx, window 
     
     fig,ax = plt.subplots()
     t_plot = t[1:num_steps]
-    ax.plot(t_plot,std_devs)
-    ax.plot(t_plot,means)
+    ax.plot(t_plot,std_devs, label = rf"$\sigma_{{{state}}}$")
+    ax.plot(t_plot,means, label = rf"$\langle{{{state}}}\rangle$")
+    ax.set_xlabel('Time (ns)')
+    ax.set_ylabel('State population')
+    ax.legend()
     #ax.vlines([window,2*window,3*window,4*window,5*window],[0,0,0,0,0],[1,1,1,1,1])
     ax.axvspan(0,5*window, color = (117/255,124/255,136/255,0.5))
-    plt.show(block = False)
+    plt.draw()
 
     fig2,ax2 = plt.subplots()
     t_plot = t[1:num_steps]
-    ax2.plot(t_plot,std_devs_sig)
+    ax2.plot(t_plot,std_devs_sig, label = rf"$\sigma_{{\sigma_{{{state}}}}}$")
     #ax2.plot(t_plot,means_sig)
     #ax.vlines([window,2*window,3*window,4*window,5*window],[0,0,0,0,0],[1,1,1,1,1])
+    ax2.set_xlabel('Time (ns)')
+    ax2.set_ylabel('State population')
+    ax2.legend()
     ax2.axvspan(0,100*window, color = (117/255,124/255,136/255,0.5))
-    plt.show()
+    plt.show(block=False)
+    return t_plot, mean, std_devs, std_devs_sig
     
+    popt, line, start, end = Calculate_T_relaxation(t_data=t_plot, y_data=std_devs_sig, start_point=100*window)
+    T = popt[1]
+    y0_pop = np.mean(y[-int(len(y)*0.1):])
+    A_pop = y[0] - y0_pop
+    pop_fit = A_pop * np.exp(-(t-t[0]) / T) + y0_pop
+    
+    fig3, ax3 = plt.subplots()
+    ax3.plot(t,pop_fit)
+    plt.show()
     #std_devs[0] = np.float64(std_devs[0])
     #std_devs = np.array(std_devs)
     #PeakEnvelopeFit(std_devs,t_plot)
+
+def Plot_T_on_TimeEvo(t_data, y_data, T_Calc_func : function):
+    popt, line, start, end = T_Calc_func()
+    t = np.array(t_data)
+    y = np.array(y_data)
+    T = popt[1]
+    C = np.mean(y[-int(len(y)*0.1):])
+    A = y[0]- C
+    fit_func = A * np.exp(-(t-t[0]) / T) + C
+    fig, ax = plt.subplots()
+    ax.plot(t,y)
+    ax.plot(t,fit_func,'r--')
+    plt.draw()
+
+def Calculate_T_relaxation(t_data, y_data, start_point, dist = 5000):
+    t_data = np.asarray(t_data)
+    y_data = np.asarray(y_data)
+    t_data = t_data[start_point:]
+    y_data = y_data[start_point:]
+
+    peaks, _ = sps.find_peaks(y_data,distance=max(1,dist), prominence=0.001)
+    if len(peaks) < 3:
+        return None, "Not enough peaks"
+    t_peaks = t_data[peaks]
+    y_peaks = y_data[peaks]
+    window_size = 3
+    y_summits = np.array([np.max(y_peaks[max(0,i-window_size//2) : min(len(y_peaks), i+window_size//2 + 1)]) for i in range(len(y_peaks))])
+    def model_func(t, A, T1, y0):
+        return A * np.exp(-t/T1) + y0
+    y0_guess = np.mean(y_summits[-max(1,len(y_summits)//5):])
+    a_guess = y_summits[0] - y0_guess
+    t1_guess = (t_peaks[-1]-t_peaks[0]) / 3
+    start_idx = np.argmax(y_summits)
+    tail_floor = np.mean(y_summits[-max(1, len(y_summits)//10):])
+    tail_std = np.std(y_summits[-max(1, len(y_summits)//10):])
+    under_threshold = np.where(y_summits[start_idx:] <= (tail_floor + tail_std))[0]
+    if len(under_threshold) > 0:
+        end_idx = start_idx + under_threshold[0] + int(len(under_threshold) * 0.2)
+    else:
+        end_idx = len(y_summits)
+    try:
+        popt, _ = spo.curve_fit(model_func, t_peaks[start_idx : end_idx],y_summits[start_idx : end_idx], p0=[a_guess,t1_guess,y0_guess])
+        fitline = model_func(t_data, *popt)
+        return popt,fitline, start_idx,end_idx
+    except Exception as e:
+        return Calculate_T_relexation_fast(t_data,y_data,25000)
+    
+def Calculate_T_relexation_fast(t_data, y_data, end):
+    def fast(t,A,T, C):
+        return A * np.exp(-t/T) + C
+
+    t = np.array(t_data)
+    y = np.array(y_data)
+    mask = t < end
+    C = np.mean(y[-5000:])
+    t = t[mask]
+    y = y[mask]
+    func = partial(fast,C=C)
+    try:
+        popt, _  = spo.curve_fit(func, t , y, p0 = [0.6,1000])
+        fitline = func(t, *popt)
+        return popt,fitline, 0,end
+    except Exception as e:
+        return None, f"Fit failed: {str(e)}"
         
 def PeakEnvelopeFit(y_data, t_data):
     y_data_d = sps.detrend(y_data)
@@ -381,11 +351,6 @@ def PeakEnvelopeFit(y_data, t_data):
     A_fit, T_fit, C_fit = popt_top
 
 
-    #start = peaks[0]
-    #popt, pcov = spo.curve_fit(model_curve, t_peaks_2, y_peaks_2, p0=intial_guess)
-    #A_fit, T_fit, C_fit = popt
-    #fit = model_curve(t_data, A_fit, T_fit, C_fit)
-
     fig,ax = plt.subplots()
     ax.plot(t_data, y_data, alpha=0.4, label='Data')
     ax.plot(t_data, upper_env, 'r', linewidth=2, label='Peak Envelope')
@@ -415,7 +380,7 @@ def main(load : bool = False):
     #file_dict = "../GitHub/MolSpin/NV_Centre_N14_results/"
     #file_dict_ssh = "Documents/GitHub/MolSpin/NV_Centre_N14_results/"
     #extension = "-4"
-    extension = "3"
+    extension = "2"
     npzfile = ""
     #file = file_dict + file_name# + extension
     file = file_name + extension
@@ -430,7 +395,7 @@ def main(load : bool = False):
     states = [['gs.t0_u', 'gs.t0_z', 'gs.t0_d', 'gs.tp_u', 'gs.tp_z', 'gs.tp_d', 'gs.td_u', 'gs.td_z', 'gs.td_d'],
               ['es.t0_u', 'es.t0_z', 'es.t0_d', 'es.tp_u', 'es.tp_z', 'es.tp_d', 'es.td_u', 'es.td_z', 'es.td_d'],
               ['ms.i'] ]
-    plotTimeEvolution(0,dat,['gs.t0'])
+    #plotTimeEvolution(0,dat,['gs.t0'])
     #plotTimeEvolution(50,dat,states[0])
     #plotTimeEvolution(92,dat,states[0])
     #plt.show(block = False)
@@ -445,7 +410,16 @@ def main(load : bool = False):
     #fft(dat,'gs.t0', 0)
     #plot_peak_decay(dat,'gs.t0', 0)
     #plot_standard_deviation(dat[0:int(len(dat)/4)],'gs.t0', 0,100)
-    plot_standard_deviation(dat,'gs.t0', 0,100)
+    t, m, sd, sdsd = plot_standard_deviation(dat,'gs.t0', 0,100)
+    bound_T = partial(Calculate_T_relaxation,t,sdsd,1000, dist = 10000)
+    indicies = dat._index_map[dat.unique_groups[0]]
+    time = dat.data['Time(ns)'][indicies]
+    signal = dat.data['gs.t0'][indicies]
+    Plot_T_on_TimeEvo(time,signal, bound_T)
+    plt.show()
+
+    
+
     #peak_
 
 
