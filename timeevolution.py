@@ -262,7 +262,7 @@ def Plot_T_on_TimeEvo(t_data, y_data, T_Calc_func : function):
     ax.plot(t,fit_func,'r--')
     plt.draw()
 
-def Calculate_T_relaxation(t_data, y_data, start_point, dist = 5000):
+def Calculate_T_relaxation(t_data, y_data, start_point, dist = 5000, fast = False,fast_time = 25000):
     t_data = np.asarray(t_data)
     y_data = np.asarray(y_data)
     t_data = t_data[start_point:]
@@ -289,11 +289,37 @@ def Calculate_T_relaxation(t_data, y_data, start_point, dist = 5000):
     else:
         end_idx = len(y_summits)
     try:
-        popt, _ = spo.curve_fit(model_func, t_peaks[start_idx : end_idx],y_summits[start_idx : end_idx], p0=[a_guess,t1_guess,y0_guess])
+        popt, _ = spo.curve_fit(model_func, t_peaks[start_idx : end_idx],y_summits[start_idx : end_idx], p0=[a_guess,t1_guess,y0_guess], bounds=[0,1e2,0])
         fitline = model_func(t_data, *popt)
         return popt,fitline, start_idx,end_idx
     except Exception as e:
-        return Calculate_T_relexation_fast(t_data,y_data,25000)
+        if fast:
+            return Calculate_T_relexation_fast(t_data,y_data,fast_time)
+        if not fast:
+            return Calculate_T_relexation_slow(t_data,y_data,t_peaks[start_idx],len(t_data))
+
+def Calculate_T_relexation_slow(t_data, y_data, start, end):
+    t = np.array(t_data)
+    y = np.array(y_data)
+    mask = t < end
+    t = t[mask]
+    y = y[mask]
+    mask = t > start
+    t = t[mask]
+    y = y[mask]
+
+    def slow(t,A,T,C):
+        return A * (1-t/T) + C
+    def actual(t,A,T,C):
+        return A * np.exp(-t/T) + C
+    A = y[0]-y[-1]
+    C = y[-1]
+    #T = (A-C)/(t[0]-t[-1])
+    slope, intercept = np.polyfit(t,y,1)
+    T = -A / slope 
+    #popt, _ = spo.curve_fit(actual, t,y, p0=[A,T,C])
+    fit = actual(t,A,T,C)
+    return [A,T,C], fit, 0, end
     
 def Calculate_T_relexation_fast(t_data, y_data, end):
     def fast(t,A,T, C):
@@ -380,7 +406,7 @@ def main(load : bool = False):
     #file_dict = "../GitHub/MolSpin/NV_Centre_N14_results/"
     #file_dict_ssh = "Documents/GitHub/MolSpin/NV_Centre_N14_results/"
     #extension = "-4"
-    extension = "2"
+    extension = "9"
     npzfile = ""
     #file = file_dict + file_name# + extension
     file = file_name + extension
@@ -411,7 +437,7 @@ def main(load : bool = False):
     #plot_peak_decay(dat,'gs.t0', 0)
     #plot_standard_deviation(dat[0:int(len(dat)/4)],'gs.t0', 0,100)
     t, m, sd, sdsd = plot_standard_deviation(dat,'gs.t0', 0,100)
-    bound_T = partial(Calculate_T_relaxation,t,sdsd,1000, dist = 10000)
+    bound_T = partial(Calculate_T_relaxation,t,sdsd,1000, dist = 10000, fast=True, fast_time =10000)
     indicies = dat._index_map[dat.unique_groups[0]]
     time = dat.data['Time(ns)'][indicies]
     signal = dat.data['gs.t0'][indicies]
