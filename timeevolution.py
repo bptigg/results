@@ -241,7 +241,7 @@ def plot_standard_deviation(data: DataPointCollection, state, group_idx, window 
     return t_plot, means, std_devs, std_devs_sig
 
 def Plot_T_on_TimeEvo(t_data, y_data, T_Calc_func : function):
-    #popt, line, start, end, cov = T_Calc_func()
+    popt, line, start, end, cov = T_Calc_func()
     t_dat = np.array(t_data)
     y = np.array(y_data)
     T = 8411.62#popt[1]
@@ -571,7 +571,7 @@ def main(load : bool = False):
     x = []
     C_val = []
     std = []
-    for i in range(5,len(filenames)):
+    for i in range(2,len(filenames)):
         t, m, sd, sdsd = plot_standard_deviation(dat,'gs.t0', i,window)
         time_idx = get_time_index(t,warm_up)
         #mode_str = determine_fit_procedure(t[time_idx:],m[time_idx:])
