@@ -17,7 +17,7 @@ class DataPointCollection:
         if _internal_state is not None:
             self.files = _internal_state['files']
             self._group_map = _internal_state['group_map']
-            self.active_indices = _internal_state['indicies']
+            self.active_indices = _internal_state['indices']
             self.file_row_offsets = _internal_state['row_offsets']
             self.cached_keys = _internal_state['keys']
             self.derivative = True
@@ -59,6 +59,7 @@ class DataPointCollection:
 
         self.last_accessed_group = 0
         self.start_background_processing(lookahead=20)
+        self.force_groups = False
 
     def _mmap_warm(self, filename):
         try:
@@ -71,18 +72,31 @@ class DataPointCollection:
     def _get_data_from_global_idx(self, key, global_idx):
         if len(self.files) == 1:
             return self.files[0][key][global_idx]
-        global_idx = int(global_idx)
-        file_idx = np.searchsorted(self.file_row_offsets, global_idx, side='right') -1
-        local_idx = global_idx - self.file_row_offsets[file_idx]
-        return self.files[file_idx][key][local_idx]
+        if isinstance(global_idx, int):
+            global_idx = int(global_idx)
+            file_idx = np.searchsorted(self.file_row_offsets, global_idx, side='right') -1
+            local_idx = global_idx - self.file_row_offsets[file_idx]
+            return self.files[file_idx][key][local_idx]
+        else:
+            idx_array = np.asanyarray(global_idx)
+            f_idx = np.searchsorted(self.file_row_offsets, global_idx, side='right') - 1
+            first_file_dtype = self.files[0][key]
+            result = np.empty(len(idx_array), dtype=first_file_dtype.dtype)
+            unique_f_ids = np.unique(f_idx)
+            for f_id in unique_f_ids:
+                mask = (f_idx == f_id)
+                local = idx_array[mask] - self.file_row_offsets[f_id]
+                result[mask] = self.files[f_id][key][local]
+            return result
     
     @property
     def data(self):
         return MultiFileProxy(self)
     
     def __len__(self):
-        if self.num_groups == 1:
+        if self.num_groups == 1 and not self.force_groups:
             return len(self.active_indices)
+        self.force_groups = False
         return self.num_groups
     def __getitem__(self, key):
         if isinstance(key, slice):
@@ -146,6 +160,7 @@ class DataPointCollection:
         num = len(np.unique(current_headers))
         return [num for _ in range(len(self))]
     def __iter__(self):
+        self.force_groups = True
         for i in range(len(self)):
             yield self[i]
     def GetKeys(self):
@@ -268,6 +283,9 @@ class MultiFileProxy:
         self.master = master
     def __getitem__(self, key):
         return KeyProxy(self.master, key)
+    def _get_data_from_global_idx(self, name, idx):
+        return self.master._get_data_from_global_idx(name, idx)
+
 
 class KeyProxy:
     def __init__(self,master : DataPointCollection, key):
@@ -278,7 +296,7 @@ class KeyProxy:
             return self.master._get_data_from_global_idx(self.key, indices)
         if(len(self.master.files)) == 1:
             return self.master.files[0][self.key][indices]
-        return np.array([self.master._get_data_from_global_idx(self.key, idx) for idx in indices])
+        return np.array(self.master._get_data_from_global_idx(self.key, indices))
 
 #def concatinate_multiple_npz_files(base_file, start_idx, end_idx):
     

@@ -15,6 +15,7 @@ import torch
 from scipy import ndimage as spd
 from functools import partial
 #from scipy.ndimage import maximum_filter1d
+from scipy.optimize import minimize
 
 CUDA = False
 if torch.cuda.is_available():
@@ -197,24 +198,27 @@ def plot_standard_deviation(data: DataPointCollection, state, group_idx, window 
     t = data.data["Time(ns)"][indicies]
     y = data.data[state][indicies]
     num_steps = len(t)
+    dts = np.concatenate([[0],np.diff(t)])
     
     ewma = dm.ExponentiallyWeightedMovingAverage(window)
-    std_devs = []
-    std_devs_sig = []
-    means = []
-    means_sig = []
-    for i in range(1,num_steps):
-        dt = t[i]-t[i-1]
-        val = y[i]
-        sigma,mean,sigma_sig, mean_sig = ewma.update(val,dt)
-        std_devs.append(sigma)
-        means.append(mean)
-        means_sig.append(mean_sig)
-        std_devs_sig.append(sigma_sig)
+    vec_update = np.frompyfunc(ewma.update, 2,4)
+    s,m,ss,ms = vec_update(y,dts)
+    std_devs = s.astype(float)
+    std_devs_sig = ss.astype(float)
+    means = m.astype(float)
+    means_sig = ms.astype(float)
+    #for i in range(1,num_steps):
+    #    dt = t[i]-t[i-1]
+    #    val = y[i]
+    #    sigma,mean,sigma_sig, mean_sig = ewma.update(val,dt)
+    #    std_devs.append(sigma)
+    #    means.append(mean)
+    #    means_sig.append(mean_sig)
+    #    std_devs_sig.append(sigma_sig)
 
     
     fig,ax = plt.subplots()
-    t_plot = t[1:num_steps]
+    t_plot = t[0:num_steps]
     ax.plot(t_plot,std_devs, label = rf"$\sigma_{{{state}}}$")
     ax.plot(t_plot,means, label = rf"$\langle{{{state}}}\rangle$")
     ax.set_xlabel('Time (ns)')
@@ -225,7 +229,7 @@ def plot_standard_deviation(data: DataPointCollection, state, group_idx, window 
     plt.draw()
 
     fig2,ax2 = plt.subplots()
-    t_plot = t[1:num_steps]
+    t_plot = t[0:num_steps]
     ax2.plot(t_plot,std_devs_sig, label = rf"$\sigma_{{\sigma_{{{state}}}}}$")
     #ax2.plot(t_plot,means_sig)
     #ax.vlines([window,2*window,3*window,4*window,5*window],[0,0,0,0,0],[1,1,1,1,1])
@@ -234,69 +238,136 @@ def plot_standard_deviation(data: DataPointCollection, state, group_idx, window 
     ax2.legend()
     ax2.axvspan(0,100*window, color = (117/255,124/255,136/255,0.5))
     plt.show(block=False)
-    return t_plot, mean, std_devs, std_devs_sig
-    
-    popt, line, start, end = Calculate_T_relaxation(t_data=t_plot, y_data=std_devs_sig, start_point=100*window)
-    T = popt[1]
-    y0_pop = np.mean(y[-int(len(y)*0.1):])
-    A_pop = y[0] - y0_pop
-    pop_fit = A_pop * np.exp(-(t-t[0]) / T) + y0_pop
-    
-    fig3, ax3 = plt.subplots()
-    ax3.plot(t,pop_fit)
-    plt.show()
-    #std_devs[0] = np.float64(std_devs[0])
-    #std_devs = np.array(std_devs)
-    #PeakEnvelopeFit(std_devs,t_plot)
+    return t_plot, means, std_devs, std_devs_sig
 
 def Plot_T_on_TimeEvo(t_data, y_data, T_Calc_func : function):
-    popt, line, start, end = T_Calc_func()
-    t = np.array(t_data)
+    #popt, line, start, end, cov = T_Calc_func()
+    t_dat = np.array(t_data)
     y = np.array(y_data)
-    T = popt[1]
+    T = 8411.62#popt[1]
     C = np.mean(y[-int(len(y)*0.1):])
     A = y[0]- C
-    fit_func = A * np.exp(-(t-t[0]) / T) + C
+    #std = cov[1][1]
+    fit_func = A * np.exp(-(t_dat-t_dat[0]) / T) + C
     fig, ax = plt.subplots()
-    ax.plot(t,y)
-    ax.plot(t,fit_func,'r--')
+    ax.plot(t_dat,y)
+    ax.plot(t_dat,fit_func,'r--', label =rf"${A:.2f} \exp \left( \frac{{-t}}{{{T:.2f}}} \right) + {C:.2f}$")
+    ax.legend()
     plt.draw()
+    plt.show()
+    return T,A,C#,std
 
-def Calculate_T_relaxation(t_data, y_data, start_point, dist = 5000, fast = False,fast_time = 25000):
+def multi_mode_exp_decay(flat_params,x):
+    a = flat_params[:50] / 100
+    log_t = flat_params[50:100]
+    c = flat_params[-1] / 10
+    
+    t = np.exp(log_t)
+    modes = a[:,np.newaxis] * np.exp(-x/t[:,np.newaxis] )
+    sum = np.sum(modes,axis = 0)
+    return c + sum
+
+def loss_function(flat_params, t, y, modes = 50):
+    y_pred = multi_mode_exp_decay(flat_params,t)
+    mean = np.mean((y-y_pred)**2)
+    return mean
+
+def jacobian_function(flat_params, x, y):
+    # 1. Unpack parameters
+    a = flat_params[:50]
+    log_t = flat_params[50:100]
+    c = flat_params[-1]
+    t = np.exp(log_t)
+    
+    # 2. Get predictions and residuals
+    modes = a[:, np.newaxis] * np.exp(-x / t[:, np.newaxis])
+    y_pred = c + np.sum(modes, axis=0)
+    residual = y_pred - y  # Shape: (N,)
+    N = len(x)
+    
+    # 3. Calculate analytical derivatives using calculus
+    # Derivative with respect to amplitudes (a)
+    grad_a = (2 / N) * np.dot(np.exp(-x / t[:, np.newaxis]), residual)
+    
+    # Derivative with respect to log_t
+    # d(model)/d(log_t) = a * (x / t) * exp(-x / t)
+    inner_t = a[:, np.newaxis] * (x / t[:, np.newaxis]) * np.exp(-x / t[:, np.newaxis])
+    grad_log_t = (2 / N) * np.dot(inner_t, residual)
+    
+    # Derivative with respect to offset (c)
+    grad_c = (2 / N) * np.sum(residual)
+    
+    # Return as a single flat array matching the 101 parameter structure
+    return np.concatenate([grad_a, grad_log_t, [grad_c]])
+
+def Calculate_T_relaxation(t_data, y_data, start_point, dist = 5000, mode = False,fast_time = 25000):
     t_data = np.asarray(t_data)
     y_data = np.asarray(y_data)
     t_data = t_data[start_point:]
     y_data = y_data[start_point:]
 
-    peaks, _ = sps.find_peaks(y_data,distance=max(1,dist), prominence=0.001)
-    if len(peaks) < 3:
-        return None, "Not enough peaks"
-    t_peaks = t_data[peaks]
-    y_peaks = y_data[peaks]
-    window_size = 3
-    y_summits = np.array([np.max(y_peaks[max(0,i-window_size//2) : min(len(y_peaks), i+window_size//2 + 1)]) for i in range(len(y_peaks))])
-    def model_func(t, A, T1, y0):
-        return A * np.exp(-t/T1) + y0
-    y0_guess = np.mean(y_summits[-max(1,len(y_summits)//5):])
-    a_guess = y_summits[0] - y0_guess
-    t1_guess = (t_peaks[-1]-t_peaks[0]) / 3
-    start_idx = np.argmax(y_summits)
-    tail_floor = np.mean(y_summits[-max(1, len(y_summits)//10):])
-    tail_std = np.std(y_summits[-max(1, len(y_summits)//10):])
-    under_threshold = np.where(y_summits[start_idx:] <= (tail_floor + tail_std))[0]
-    if len(under_threshold) > 0:
-        end_idx = start_idx + under_threshold[0] + int(len(under_threshold) * 0.2)
-    else:
-        end_idx = len(y_summits)
-    try:
-        popt, _ = spo.curve_fit(model_func, t_peaks[start_idx : end_idx],y_summits[start_idx : end_idx], p0=[a_guess,t1_guess,y0_guess], bounds=[0,1e2,0])
-        fitline = model_func(t_data, *popt)
-        return popt,fitline, start_idx,end_idx
-    except Exception as e:
-        if fast:
-            return Calculate_T_relexation_fast(t_data,y_data,fast_time)
-        if not fast:
-            return Calculate_T_relexation_slow(t_data,y_data,t_peaks[start_idx],len(t_data))
+    ymax = np.max(y_data)
+    init_amp = np.ones(50) * (ymax/50) * 100
+    init_decay = np.geomspace(0.1,1e6,50)
+    init_log_decay = np.log(init_decay)
+    init_offset = [np.mean(y_data[-10:]) * 10] 
+    init_guess = np.concatenate([init_amp, init_log_decay,init_offset])
+
+    bounds = ([(0.0,100)] * 50 + [(None,None)] * 50 + [(0.0,10)])
+
+
+    result = minimize(
+        loss_function,
+        init_guess,
+        args = (t_data,y_data),
+        bounds=bounds,
+        method = 'L-BFGS-B',
+        jac = jacobian_function,
+        options={'maxiter': 5000, 'ftol':1e-5}
+    )
+
+    fit_amp = result.x[:50] / 100
+    fit_decay = np.exp(result.x[50:100]) 
+    fit_offset = result.x[100] / 10
+
+    t = 0
+    for i in range(0,50):
+        t += fit_decay[i] * fit_amp[i]
+    print(t)
+
+    #peaks, _ = sps.find_peaks(y_data,distance=max(1,dist), prominence=0.001)
+    #if len(peaks) < 3:
+    #    return None, "Not enough peaks"
+    #t_peaks = t_data[peaks]
+    #y_peaks = y_data[peaks]
+    #window_size = 3
+    #y_summits = np.array([np.max(y_peaks[max(0,i-window_size//2) : min(len(y_peaks), i+window_size//2 + 1)]) for i in range(len(y_peaks))])
+#
+    #y0_guess = np.mean(y_summits[-max(1,len(y_summits)//5):])
+    #a_guess = y_summits[0] - y0_guess
+    #t1_guess = (t_peaks[-1]-t_peaks[0]) / 3
+    #start_idx = np.argmax(y_summits)
+    #tail_floor = np.mean(y_summits[-max(1, len(y_summits)//10):])
+    #tail_std = np.std(y_summits[-max(1, len(y_summits)//10):])
+    #under_threshold = np.where(y_summits[start_idx:] <= (tail_floor + tail_std))[0]
+    #if len(under_threshold) > 0:
+    #    end_idx = start_idx + under_threshold[0] + int(len(under_threshold) * 0.2)
+    #else:
+    #    end_idx = len(y_summits)
+    #try:
+    #    popt, _ = spo.curve_fit(model_func, t_peaks[start_idx : end_idx],y_summits[start_idx : end_idx], p0=[a_guess,t1_guess,y0_guess], bounds=[0,1e2,0])
+    #    fitline = model_func(t_data, *popt)
+    #    return popt,fitline, start_idx,end_idx
+    #except Exception as e:
+    #if mode == "fast":
+    #    return Calculate_T_relexation_fast(t_data,y_data,fast_time)
+    #if mode == "slow":
+    #    return Calculate_T_relexation_slow(t_data,y_data,t_peaks[start_idx],len(t_data))
+    #else:
+    #    popt, cov = spo.curve_fit(exp_decay, t_peaks[start_idx : end_idx],y_summits[start_idx : end_idx], p0=[a_guess,t1_guess,y0_guess])
+    #    fitline = exp_decay(t_data, *popt)
+    #    return popt,fitline, start_idx,end_idx,cov
+        
 
 def Calculate_T_relexation_slow(t_data, y_data, start, end):
     t = np.array(t_data)
@@ -319,7 +390,7 @@ def Calculate_T_relexation_slow(t_data, y_data, start, end):
     T = -A / slope 
     #popt, _ = spo.curve_fit(actual, t,y, p0=[A,T,C])
     fit = actual(t,A,T,C)
-    return [A,T,C], fit, 0, end
+    return [A,T,C], fit, 0, end,[[],[0.0,0.0]]
     
 def Calculate_T_relexation_fast(t_data, y_data, end):
     def fast(t,A,T, C):
@@ -333,11 +404,65 @@ def Calculate_T_relexation_fast(t_data, y_data, end):
     y = y[mask]
     func = partial(fast,C=C)
     try:
-        popt, _  = spo.curve_fit(func, t , y, p0 = [0.6,1000])
+        popt, cov  = spo.curve_fit(func, t , y, p0 = [0.6,1000])
         fitline = func(t, *popt)
-        return popt,fitline, 0,end
+        return popt,fitline, 0,end,cov
     except Exception as e:
         return None, f"Fit failed: {str(e)}"
+
+def determine_fit_procedure(t_data, y_data, slow_threshold = 0.05, fast_threshold = 0.8, normal_threshold = 0.5, normal_slope = 10, hl_threshold = 0.02):
+    total_range = y_data[0] - y_data[-1]
+    fluc = np.max(y_data) - np.min(y_data)
+    
+    tp = int(len(y_data) * 0.1)
+    start = y_data[:tp]
+    mid = y_data[tp:-tp]
+    end = y_data[-tp:]
+    total_drop = np.mean(start) - np.mean(end)
+    noise = np.std(end)
+
+
+    if total_range < slow_threshold:
+        return "slow"
+    if fluc < (3*noise):
+        return "slow"
+
+    drop_to_mid = np.mean(start) - np.mean(mid)
+    if drop_to_mid > (fast_threshold * total_drop) and drop_to_mid < total_drop:
+        return "fast"
+    elif drop_to_mid > (normal_threshold * total_drop) and drop_to_mid < total_drop:
+        return "normal"
+    elif drop_to_mid < total_drop:
+        return "slow"
+
+    slope_1 = np.polyfit(t_data[:tp], y_data[:tp], 1)[0]
+    slope_2 = np.polyfit(t_data[-1*tp:], y_data[-1*tp:], 1)[0]
+    slope_ratio = abs(slope_1 / slope_2) if slope_2 != 0 else 1000
+    if slope_ratio > normal_slope:
+        half_life_idx = np.where(y_data < (y_data[0] - total_range/2))[0]
+        if len(half_life_idx) > 0 and half_life_idx[0] < len(y_data) * hl_threshold:
+            return "fast"
+        return "normal" 
+        
+    return "slow"
+    
+    #slope, _ = np.polyfit(t_data,y_data,1)
+    #inital_drop = y_data[0] - y_data[int(len(y_data)*0.1)]
+    #if total_range < (3*noise_level):
+    #    return "slow"
+    #if inital_drop >= (1-fast_threshold)*total_range and abs(slope) > fast_slope:
+    #    return "fast"
+    #if abs(slope) < slow_threshold:
+    #    return "slow"
+    #return "normal"
+
+def get_time_index(t_data,time):
+    idx = np.searchsorted(t_data, time)
+    if idx < len(t_data):
+        return idx
+    else:
+        return len(t_data)
+
         
 def PeakEnvelopeFit(y_data, t_data):
     y_data_d = sps.detrend(y_data)
@@ -406,7 +531,9 @@ def main(load : bool = False):
     #file_dict = "../GitHub/MolSpin/NV_Centre_N14_results/"
     #file_dict_ssh = "Documents/GitHub/MolSpin/NV_Centre_N14_results/"
     #extension = "-4"
-    extension = "9"
+    extension = "8"
+    filenames = [file_name + rf"{i}" + ".npz" for i in range(0,10)]
+    
     npzfile = ""
     #file = file_dict + file_name# + extension
     file = file_name + extension
@@ -416,7 +543,8 @@ def main(load : bool = False):
     else:
         npzfile = file + ".npz"
     #dat = DataPointCollection(npzfile)
-    dat = DataPointCollection(file_name + extension + ".npz")
+    #dat = DataPointCollection(file_name + extension + ".npz")
+    dat = DataPointCollection(filenames)
 
     states = [['gs.t0_u', 'gs.t0_z', 'gs.t0_d', 'gs.tp_u', 'gs.tp_z', 'gs.tp_d', 'gs.td_u', 'gs.td_z', 'gs.td_d'],
               ['es.t0_u', 'es.t0_z', 'es.t0_d', 'es.tp_u', 'es.tp_z', 'es.tp_d', 'es.td_u', 'es.td_z', 'es.td_d'],
@@ -436,13 +564,47 @@ def main(load : bool = False):
     #fft(dat,'gs.t0', 0)
     #plot_peak_decay(dat,'gs.t0', 0)
     #plot_standard_deviation(dat[0:int(len(dat)/4)],'gs.t0', 0,100)
-    t, m, sd, sdsd = plot_standard_deviation(dat,'gs.t0', 0,100)
-    bound_T = partial(Calculate_T_relaxation,t,sdsd,1000, dist = 10000, fast=True, fast_time =10000)
-    indicies = dat._index_map[dat.unique_groups[0]]
-    time = dat.data['Time(ns)'][indicies]
-    signal = dat.data['gs.t0'][indicies]
-    Plot_T_on_TimeEvo(time,signal, bound_T)
-    plt.show()
+    window = 100
+    warm_up = 5*window
+    regime = ["slow","slow", "slow", "slow", "slow", "normal", "fast", "fast", "fast", "fast"]
+    T_times = []
+    x = []
+    C_val = []
+    std = []
+    for i in range(5,len(filenames)):
+        t, m, sd, sdsd = plot_standard_deviation(dat,'gs.t0', i,window)
+        time_idx = get_time_index(t,warm_up)
+        #mode_str = determine_fit_procedure(t[time_idx:],m[time_idx:])
+        mode_str = regime[i]
+        print("MODE: " + mode_str)
+
+        bound_T = partial(Calculate_T_relaxation,t,sdsd,1000, dist = 10000, mode=mode_str, fast_time =10000)
+        indicies = dat._index_map[dat.unique_groups[i]]
+        time = dat.data['Time(ns)'][indicies]
+        signal = dat.data['gs.t0'][indicies]
+        strain = dat.data['gs.strain.ex'][indicies][0]
+        T, _,C,S = Plot_T_on_TimeEvo(time,signal, bound_T)
+        T_times.append(T)
+        C_val.append(C)
+        x.append(strain)
+        std.append(S)
+        #plt.close()
+    
+    fig,ax = plt.subplots()
+    ax.errorbar(x,T_times,yerr=std, fmt='o', capsize=5, capthick=1, color='blue',ecolor='red')
+    ax.set_yscale('log')
+    ax.set_xscale('log')
+    log_y = np.log(T_times)
+    log_x = np.log(x)
+    slope,intercept = np.polyfit(log_x,log_y,1)
+    a = np.exp(intercept)
+    b = slope
+    x = np.array(x)
+    func = lambda x, a, b : a * np.exp(b*x)
+    x_fit = np.geomspace(min(x),max(x), 1000)
+    fit = a * (x_fit**b) 
+    ax.plot(x_fit,fit,linestyle='--',color = 'black', linewidth=2)
+    plt.show(block=True)
 
     
 

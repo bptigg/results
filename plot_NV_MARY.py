@@ -298,9 +298,9 @@ def main():
     headers = data[0]
     #stab_pop, num = CollectStabalizedPopulations(data,headers,[2,3],4,['es.t0_u', 'es.t0_z', 'es.t0_d', 'es.tp_u', 'es.tp_z', 'es.tp_d', 'es.td_u', 'es.td_z', 'es.td_d'])
     stab_pop, num = CollectStabalizedPopulations(data,headers,2,3,['es.t0_u', 'es.t0_z', 'es.t0_d', 'es.tp_u', 'es.tp_z', 'es.tp_d', 'es.td_u', 'es.td_z', 'es.td_d'])#, 'ms.i'])
-    save_stabalised_population("NV_N14_GSLAC-PL-5", stab_pop)
+    save_stabalised_population("NV_N14_GSLAC-PL-1", stab_pop)
 
-    stab_pop,num = load_stabalised_population("NV_N14_GSLAC-PL-5")
+    stab_pop,num = load_stabalised_population("NV_N14_GSLAC-PL-1")
     #num =[9]
     
     #stab_pop, num = CollectStabalizedPopulations(data,headers,3,4,['gs.t0','gs.t0_u', 'gs.t0_z', 'gs.t0_d', 'gs.tp_u', 'gs.tp_z', 'gs.tp_d', 'gs.td_u', 'gs.td_z', 'gs.td_d'])
