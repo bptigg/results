@@ -14,8 +14,11 @@ from scipy import interpolate as spint
 import torch
 from scipy import ndimage as spd
 from functools import partial
-#from scipy.ndimage import maximum_filter1d
-from scipy.optimize import minimize
+import concurrent.futures
+from scipy.optimize import nnls
+from sklearn.linear_model import Ridge
+from sklearn.linear_model import LinearRegression
+import itertools
 
 CUDA = False
 if torch.cuda.is_available():
@@ -138,30 +141,6 @@ def plot_kinetics(states = [], sol = None, t = None):
     plt.show()
 
 
-def lombscargle(t,y):
-    y_centre = y - np.mean(y)
-    freqs = np.linspace(0.001, 10, 10000)
-    pgram = sps.lombscargle(t,y_centre, freqs*2*np.pi)
-    return freqs[np.argmax(pgram)]
-
-def lombscargle2(t,y):
-    y_centre = y - np.mean(y)
-    pgram = []
-    freqs = []
-    if CUDA:
-        freq, power = ats.LombScargle(t,y,nterms=1).autopower(method="fastnifty")
-    else:
-        freq, power = ats.LombScargle(t,y,nterms=1).autopower()
-    #for i in range(5):
-    #    freq_i = np.linspace(i, i+1, 1000)
-    #    pgram_ = #sps.lombscargle(t,y_centre, freq_i*2*np.pi)
-    
-    #    freqs.append(freq_i)
-    #    pgram.append(pgram_)
-    return freq, power
-
-
-
 def fft(data : DataPointCollection, state, group_idx):
     indicies = data._index_map[data.unique_groups[group_idx]]
     t = data.data["Time(ns)"][indicies]
@@ -172,26 +151,9 @@ def fft(data : DataPointCollection, state, group_idx):
     ax.plot(f,p)
     plt.show()
 
-def peak_decay(data: DataPointCollection, state, group_idx, dist = 10):
-    indicies = data._index_map[data.unique_groups[group_idx]]
-    t = data.data["Time(ns)"][indicies]
-    y = data.data[state][indicies]
-    mask = np.diff(t,prepend=t[0]-1) > 1e-15
-    t = t[mask]
-    y = y[mask]
-    peaks, _ = sps.find_peaks(y,distance=dist)
-    peak_t = np.concatenate(([t[0]], t[peaks], [t[-1]]))
-    peak_y = np.concatenate(([y[0]], y[peaks], [y[-1]]))
 
-    f_env = spint.interp1d(peak_t, peak_y, kind='cubic', fill_value='extrapolate')
-    return f_env(t),t,y
 
-def plot_peak_decay(data: DataPointCollection, state, group_idx):
-    upper_env,t,y = peak_decay(data,state,group_idx)
-    fig,ax = plt.subplots()
-    ax.plot(t,y,alpha = 0.4)
-    ax.plot(t,upper_env, 'r', linewidth = 2)
-    plt.show(block=False)
+
 
 def plot_standard_deviation(data: DataPointCollection, state, group_idx, window = 100):
     indicies = data._index_map[data.unique_groups[group_idx]]
@@ -227,6 +189,7 @@ def plot_standard_deviation(data: DataPointCollection, state, group_idx, window 
     #ax.vlines([window,2*window,3*window,4*window,5*window],[0,0,0,0,0],[1,1,1,1,1])
     ax.axvspan(0,5*window, color = (117/255,124/255,136/255,0.5))
     plt.draw()
+    plt.savefig("mean")
 
     fig2,ax2 = plt.subplots()
     t_plot = t[0:num_steps]
@@ -238,15 +201,16 @@ def plot_standard_deviation(data: DataPointCollection, state, group_idx, window 
     ax2.legend()
     ax2.axvspan(0,100*window, color = (117/255,124/255,136/255,0.5))
     plt.show(block=False)
+    plt.savefig("sig")
     return t_plot, means, std_devs, std_devs_sig
 
 def Plot_T_on_TimeEvo(t_data, y_data, T_Calc_func : function):
-    popt, line, start, end, cov = T_Calc_func()
+    T, offset, SNR, freqs= T_Calc_func()
     t_dat = np.array(t_data)
     y = np.array(y_data)
-    T = 8411.62#popt[1]
-    C = np.mean(y[-int(len(y)*0.1):])
-    A = y[0]- C
+    #T = 11548#popt[1]
+    C = 0.33#np.mean(y[-int(len(y)*0.1):])
+    A = (y[0]- C)
     #std = cov[1][1]
     fit_func = A * np.exp(-(t_dat-t_dat[0]) / T) + C
     fig, ax = plt.subplots()
@@ -255,206 +219,268 @@ def Plot_T_on_TimeEvo(t_data, y_data, T_Calc_func : function):
     ax.legend()
     plt.draw()
     plt.show()
-    return T,A,C#,std
+    plt.savefig("fig1")
+    return T,A,C, SNR, freqs
 
-def multi_mode_exp_decay(flat_params,x):
-    a = flat_params[:50] / 100
-    log_t = flat_params[50:100]
-    c = flat_params[-1] / 10
+nnls_solver = LinearRegression(positive=True, fit_intercept=False, copy_X=False)
+def solve_single_alpha(alpha, M, y_shifted, n_modes):
+    # Construct the Tikhonov-augmented matrices
+    M_reg = np.vstack([M, alpha * np.eye(n_modes)])
+    y_reg = np.concatenate([y_shifted, np.zeros(n_modes)])
     
-    t = np.exp(log_t)
-    modes = a[:,np.newaxis] * np.exp(-x/t[:,np.newaxis] )
-    sum = np.sum(modes,axis = 0)
-    return c + sum
+    # Solve NNLS
+    print(f"{alpha} : Starting")
+    #amps, _ = nnls(M_reg, y_reg)
 
-def loss_function(flat_params, t, y, modes = 50):
-    y_pred = multi_mode_exp_decay(flat_params,t)
-    mean = np.mean((y-y_pred)**2)
-    return mean
+    nnls_solver.fit(M_reg, y_reg)
+    amps = nnls_solver.coef_
+    
+    # Calculate Norms
+    res_norm = np.linalg.norm(np.dot(M, amps) - y_shifted)
+    sol_norm = np.linalg.norm(amps)
+    print(f"{alpha} : Done")
+    
+    return res_norm, sol_norm, amps
 
-def jacobian_function(flat_params, x, y):
-    # 1. Unpack parameters
-    a = flat_params[:50]
-    log_t = flat_params[50:100]
-    c = flat_params[-1]
-    t = np.exp(log_t)
-    
-    # 2. Get predictions and residuals
-    modes = a[:, np.newaxis] * np.exp(-x / t[:, np.newaxis])
-    y_pred = c + np.sum(modes, axis=0)
-    residual = y_pred - y  # Shape: (N,)
-    N = len(x)
-    
-    # 3. Calculate analytical derivatives using calculus
-    # Derivative with respect to amplitudes (a)
-    grad_a = (2 / N) * np.dot(np.exp(-x / t[:, np.newaxis]), residual)
-    
-    # Derivative with respect to log_t
-    # d(model)/d(log_t) = a * (x / t) * exp(-x / t)
-    inner_t = a[:, np.newaxis] * (x / t[:, np.newaxis]) * np.exp(-x / t[:, np.newaxis])
-    grad_log_t = (2 / N) * np.dot(inner_t, residual)
-    
-    # Derivative with respect to offset (c)
-    grad_c = (2 / N) * np.sum(residual)
-    
-    # Return as a single flat array matching the 101 parameter structure
-    return np.concatenate([grad_a, grad_log_t, [grad_c]])
+def find_Lcurve_minima(alpha_values, residual_norms, solution_norms):
+    x = np.log10(residual_norms)
+    y = np.log10(solution_norms)
 
-def Calculate_T_relaxation(t_data, y_data, start_point, dist = 5000, mode = False,fast_time = 25000):
+    dx = np.gradient(x)
+    dy = np.gradient(y)
+    ddx = np.gradient(dx)
+    ddy = np.gradient(dy)
+    
+    curvature = (dx * ddy - dy * ddx) / (dx**2 + dy**2)**(1.5)
+    
+    optimal_idx = np.argmax(np.abs(curvature))
+    return alpha_values[optimal_idx], optimal_idx
+
+def Calculate_T_relaxation(t_data, y_data, start_point):
     t_data = np.asarray(t_data)
     y_data = np.asarray(y_data)
-    t_data = t_data[start_point:]
-    y_data = y_data[start_point:]
+    cuttoff = start_point
+    mask = t_data > cuttoff
+    #mask_2 = t_data > t_data[-1] - 1000
+    t_data = t_data[mask]
+    y_data_2 = y_data[mask]
+    y_max = np.max(y_data_2)
+    y_max_index = np.argmax(y_data_2)
+    t_index = t_data[y_max_index]
+    mask = t_data > t_index
+    y_data_3 = y_data_2[mask]
+    t_data_2 = t_data[mask]
+    y_data_shifted = y_data_3 - 1/3
+    #t_data = t_data[mask]
+    #tail = y_data[mask_2]
 
-    ymax = np.max(y_data)
-    init_amp = np.ones(50) * (ymax/50) * 100
-    init_decay = np.geomspace(0.1,1e6,50)
-    init_log_decay = np.log(init_decay)
-    init_offset = [np.mean(y_data[-10:]) * 10] 
-    init_guess = np.concatenate([init_amp, init_log_decay,init_offset])
+    modes = 50
 
-    bounds = ([(0.0,100)] * 50 + [(None,None)] * 50 + [(0.0,10)])
+    offset = t_data_2[0]
+    t_shifted = t_data_2 - offset
+    t_shifted = t_shifted / 1e3
+    tau_grid = np.linspace(-3,5.5,modes)#np.linespace(-4,1,modes)
 
+    residual_norms = []
+    solution_norms = []
+    all_amplitudes = []
+    alphas = []
 
-    result = minimize(
-        loss_function,
-        init_guess,
-        args = (t_data,y_data),
-        bounds=bounds,
-        method = 'L-BFGS-B',
-        jac = jacobian_function,
-        options={'maxiter': 5000, 'ftol':1e-5}
-    )
+    M = np.exp(-t_shifted[:, np.newaxis] / np.power(10, tau_grid))
 
-    fit_amp = result.x[:50] / 100
-    fit_decay = np.exp(result.x[50:100]) 
-    fit_offset = result.x[100] / 10
+    alpha = 0.01
+    step_factor_bounds = [1.1,5]
+    max_alphas = 100
 
-    t = 0
-    for i in range(0,50):
-        t += fit_decay[i] * fit_amp[i]
-    print(t)
+    print("Starting adaptive gradient-controlled L-curve trace")
+    while len(alphas) < max_alphas:
+        res_norm, sol_norm, amps = solve_single_alpha(alpha, M, y_data_shifted, modes)
+        residual_norms.append(res_norm)
+        solution_norms.append(sol_norm)
+        all_amplitudes.append(amps)
+        alphas.append(alpha)
 
-    #peaks, _ = sps.find_peaks(y_data,distance=max(1,dist), prominence=0.001)
-    #if len(peaks) < 3:
-    #    return None, "Not enough peaks"
-    #t_peaks = t_data[peaks]
-    #y_peaks = y_data[peaks]
-    #window_size = 3
-    #y_summits = np.array([np.max(y_peaks[max(0,i-window_size//2) : min(len(y_peaks), i+window_size//2 + 1)]) for i in range(len(y_peaks))])
+        if len(alphas) >= 2:
+            delta_res = (residual_norms[-1] - residual_norms[-2]) / residual_norms[-2]
+            total_growth = (residual_norms[-1] - residual_norms[0]) / residual_norms[0]
+            delta_res = abs(delta_res)
+            total_growth = abs(total_growth)
+            if total_growth > 0.005:
+                print(f"Early stopping triggered at \u03b1 = {alpha:.4f}! Curve cleared the elbow.")
+                break
+            sensitivity = 50.0 
+            adaptive_multiplier = step_factor_bounds[1] / (1.0 + sensitivity * delta_res)
+            step_factor = max(step_factor_bounds[0], min(step_factor_bounds[1], adaptive_multiplier))
+        else:
+            step_factor = step_factor_bounds[0]
+        alpha *= step_factor
+
+    print("Calculation finished successfully!")
+    fig,ax = plt.subplots(figsize=(7,6))
+    ax.plot(residual_norms, solution_norms, '-o', markersize=4, color='blue', label='L-curve')
+    ax.set_yscale('log')
+
+    ax.xaxis.set_major_locator(plt.MaxNLocator(4))
+    ax.get_xaxis().get_major_formatter().set_useOffset(False)
+    ax.get_xaxis().get_major_formatter().set_scientific(False)
+    plt.xticks(rotation=25)
+
+    min_spatial_distance = 0.12 
+    last_x, last_y = float('-inf'), float('-inf')
+    x = residual_norms 
+    y_log = np.log10(solution_norms)
+    for i in range(len(alphas)):
+        distance = np.sqrt((x[i] - last_x)**2 + (y_log[i] - last_y)**2)
+        if distance >= min_spatial_distance:
+            plt.annotate(
+                f"α={alphas[i]:.4f}", 
+                (residual_norms[i], solution_norms[i]),
+                textcoords="offset points", 
+                xytext=(10, 5), # Constant small offset from the dot
+                ha='left', 
+                fontsize=9
+            )
+            last_x, last_y = x[i], y_log[i]
+        
+    plt.xlabel('Residual Norm ||M*A - y||₂ (Fit Error)')
+    plt.ylabel('Solution Norm ||A||₂ (Spectrum Structure)')
+    plt.title('L-Curve for Finding Optimal Regularization')
+    plt.grid(True, which="both", ls="--")
+    plt.tight_layout()
+    plt.axvspan(min(residual_norms), residual_norms[-2], color='green', alpha=0.1, label='Elbow Region')
+    plt.legend()
+    plt.show()
+    plt.savefig('alpha')
+
+    fig,ax = plt.subplots(figsize=(7,6))
+    ax.plot(alphas, residual_norms,'-o',markersize=4,color='red')
+    plt.ylabel('Residual Norm ||M*A - y||₂ (Fit Error)')
+    plt.xlabel(f"α")
+    plt.grid(True, which="both", ls="--")
+    plt.tight_layout()
+    plt.legend()
+    plt.show()
+    plt.savefig('alpha_residual')
+
+    opt_idx = len(alphas)-2
+    alpha_opt = alphas[opt_idx]
+    best_amplitudes = all_amplitudes[opt_idx]
+
+    mode_weights = best_amplitudes
+
+    actual_taus = np.power(10, tau_grid) * 1e3
+
+    total = np.sum(mode_weights)
+    factor = 1 / total
+    normalized_weights = mode_weights * factor
+    threshold = 0.05
+    mask = normalized_weights > threshold
+    weights = normalized_weights[mask]
+    if(np.sum(weights) > 0):
+        avg_tau = np.sum(weights * actual_taus[mask]) / np.sum(weights)
+    else:
+        avg_tau = 0.0
+    
+
+    #mask = mode_weights > 0.005
+    #if np.sum(mode_weights[mask]) > 0:
+    #    avg_tau = np.sum(mode_weights[mask] * actual_taus[mask]) / np.sum(mode_weights[mask])
+    #else:
+    #    avg_tau = 0  
+    print(f"Ensemble Average Decay Time (Tau): {avg_tau:.4f}")
+
+    
+    t_shifted = t_data - t_data[0]
+    exponentials_fit = np.exp(-t_shifted[:, np.newaxis] / actual_taus)
+    y_fit_line = 1/3 + (exponentials_fit @ mode_weights)
+
+    plt.figure(figsize=(10, 5), dpi=120)
+    plt.plot(t_data, y_data_2, color='black', alpha=0.5, label='')
+    plt.plot(t_shifted, y_fit_line, color='crimson', lw=2.5, label='50-Mode Log-Lifetime Reconstruction')
+    plt.axvspan(0, cuttoff, color='gray', alpha=0.15, label='Ignored Transient Window')
+    plt.xlabel('Time (ns)', fontsize=11)
+    plt.ylabel('Mean', fontsize=11)
+    plt.ticklabel_format(axis='x', style='sci', scilimits=(6,6))
+    plt.legend(loc='upper right')
+    plt.tight_layout()
+    plt.savefig("relaxation.png")
+    plt.close()
+
+    plot_residuals(y_data_2,y_fit_line,t_data)
+    return avg_tau, offset, GetSNR(y_data_2,y_fit_line), classify_bath(y_data_2,y_fit_line,t_data)
+
+def residuals(raw,fit):
+    residual = raw - fit
+    points = len(raw)
+    noise = np.sum(residual**2) / points
+    return noise
+
+def plot_residuals(raw,fit,t_data):
+    residuals = abs(raw-fit)
+    fig,ax = plt.subplots()
+    ax.plot(t_data,residuals,color='crimson',lw=2.5)
+    fig.savefig('residuals')
+    plt.show()
+
+def classify_bath(raw, fit,t_data):
+    total_time = t_data[-1] - t_data[0]
+    points = len(t_data)
+    mean_dt = total_time / points
+    fs_uniform = 1 / mean_dt
+    t_uniform = np.linspace(t_data[0], t_data[-1], points)
+
+    cum_max = np.maximum.accumulate(t_data)
+    strict_mask = np.zeros(len(t_data), dtype=bool)
+    strict_mask[0] = True
+    strict_mask[1:] = t_data[1:] > cum_max[:-1]
+
+    raw_res = raw-fit
+
+    t = t_data[strict_mask]
+    res_clean = raw_res[strict_mask]
+
+    interp_func = spint.interp1d(t, res_clean, kind='cubic')
+    res = interp_func(t_uniform)
+    freq,psd = sps.welch(res,fs=fs_uniform,nperseg=1024)
+
+    fig,ax = plt.subplots()
+    ax.plot(freq,psd)
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.savefig("freq")
+    plt.show()
+    plt.close()
+    return [freq,psd]
+    
+    #peaks,properties = signal.find_peaks(psd,prominence=np.mean(psd)*0.1)
+    #if len(peaks) == 0:
+    #    return "Overdamped / Decoupled (Pure Noise Floor)"
+    #
+    #largest_peak_idx = peaks[np.argmax(psd[peaks])]
+    #peak_power = psd[largest_peak_idx]
+    #median_noise = np.median(psd)
+    #
+    #pnr = peak_power / median_noise
+    #prominence_threshold = 5.0
 #
-    #y0_guess = np.mean(y_summits[-max(1,len(y_summits)//5):])
-    #a_guess = y_summits[0] - y0_guess
-    #t1_guess = (t_peaks[-1]-t_peaks[0]) / 3
-    #start_idx = np.argmax(y_summits)
-    #tail_floor = np.mean(y_summits[-max(1, len(y_summits)//10):])
-    #tail_std = np.std(y_summits[-max(1, len(y_summits)//10):])
-    #under_threshold = np.where(y_summits[start_idx:] <= (tail_floor + tail_std))[0]
-    #if len(under_threshold) > 0:
-    #    end_idx = start_idx + under_threshold[0] + int(len(under_threshold) * 0.2)
+    #if pnr > prominence_threshold:
+    #    return f"Underdamped (Coherent Ringing at {freq[largest_peak_idx]:.4f} Hz)"
     #else:
-    #    end_idx = len(y_summits)
-    #try:
-    #    popt, _ = spo.curve_fit(model_func, t_peaks[start_idx : end_idx],y_summits[start_idx : end_idx], p0=[a_guess,t1_guess,y0_guess], bounds=[0,1e2,0])
-    #    fitline = model_func(t_data, *popt)
-    #    return popt,fitline, start_idx,end_idx
-    #except Exception as e:
-    #if mode == "fast":
-    #    return Calculate_T_relexation_fast(t_data,y_data,fast_time)
-    #if mode == "slow":
-    #    return Calculate_T_relexation_slow(t_data,y_data,t_peaks[start_idx],len(t_data))
-    #else:
-    #    popt, cov = spo.curve_fit(exp_decay, t_peaks[start_idx : end_idx],y_summits[start_idx : end_idx], p0=[a_guess,t1_guess,y0_guess])
-    #    fitline = exp_decay(t_data, *popt)
-    #    return popt,fitline, start_idx,end_idx,cov
-        
-
-def Calculate_T_relexation_slow(t_data, y_data, start, end):
-    t = np.array(t_data)
-    y = np.array(y_data)
-    mask = t < end
-    t = t[mask]
-    y = y[mask]
-    mask = t > start
-    t = t[mask]
-    y = y[mask]
-
-    def slow(t,A,T,C):
-        return A * (1-t/T) + C
-    def actual(t,A,T,C):
-        return A * np.exp(-t/T) + C
-    A = y[0]-y[-1]
-    C = y[-1]
-    #T = (A-C)/(t[0]-t[-1])
-    slope, intercept = np.polyfit(t,y,1)
-    T = -A / slope 
-    #popt, _ = spo.curve_fit(actual, t,y, p0=[A,T,C])
-    fit = actual(t,A,T,C)
-    return [A,T,C], fit, 0, end,[[],[0.0,0.0]]
-    
-def Calculate_T_relexation_fast(t_data, y_data, end):
-    def fast(t,A,T, C):
-        return A * np.exp(-t/T) + C
-
-    t = np.array(t_data)
-    y = np.array(y_data)
-    mask = t < end
-    C = np.mean(y[-5000:])
-    t = t[mask]
-    y = y[mask]
-    func = partial(fast,C=C)
-    try:
-        popt, cov  = spo.curve_fit(func, t , y, p0 = [0.6,1000])
-        fitline = func(t, *popt)
-        return popt,fitline, 0,end,cov
-    except Exception as e:
-        return None, f"Fit failed: {str(e)}"
-
-def determine_fit_procedure(t_data, y_data, slow_threshold = 0.05, fast_threshold = 0.8, normal_threshold = 0.5, normal_slope = 10, hl_threshold = 0.02):
-    total_range = y_data[0] - y_data[-1]
-    fluc = np.max(y_data) - np.min(y_data)
-    
-    tp = int(len(y_data) * 0.1)
-    start = y_data[:tp]
-    mid = y_data[tp:-tp]
-    end = y_data[-tp:]
-    total_drop = np.mean(start) - np.mean(end)
-    noise = np.std(end)
+    #    return "Overdamped / Thermalized (No Dominant Coherent Mode)"
 
 
-    if total_range < slow_threshold:
-        return "slow"
-    if fluc < (3*noise):
-        return "slow"
 
-    drop_to_mid = np.mean(start) - np.mean(mid)
-    if drop_to_mid > (fast_threshold * total_drop) and drop_to_mid < total_drop:
-        return "fast"
-    elif drop_to_mid > (normal_threshold * total_drop) and drop_to_mid < total_drop:
-        return "normal"
-    elif drop_to_mid < total_drop:
-        return "slow"
+def signal(raw):
+    points = len(raw)
+    power = np.sum(raw**2) / points
+    return power
 
-    slope_1 = np.polyfit(t_data[:tp], y_data[:tp], 1)[0]
-    slope_2 = np.polyfit(t_data[-1*tp:], y_data[-1*tp:], 1)[0]
-    slope_ratio = abs(slope_1 / slope_2) if slope_2 != 0 else 1000
-    if slope_ratio > normal_slope:
-        half_life_idx = np.where(y_data < (y_data[0] - total_range/2))[0]
-        if len(half_life_idx) > 0 and half_life_idx[0] < len(y_data) * hl_threshold:
-            return "fast"
-        return "normal" 
-        
-    return "slow"
-    
-    #slope, _ = np.polyfit(t_data,y_data,1)
-    #inital_drop = y_data[0] - y_data[int(len(y_data)*0.1)]
-    #if total_range < (3*noise_level):
-    #    return "slow"
-    #if inital_drop >= (1-fast_threshold)*total_range and abs(slope) > fast_slope:
-    #    return "fast"
-    #if abs(slope) < slow_threshold:
-    #    return "slow"
-    #return "normal"
+def GetSNR(raw,fit):
+    raw_dyn = raw - np.min(raw)
+    noise = residuals(raw_dyn,fit)
+    snr = (signal(raw_dyn))/noise
+    snr_db = 10 * np.log10(snr)
+    return snr_db
 
 def get_time_index(t_data,time):
     idx = np.searchsorted(t_data, time)
@@ -463,56 +489,160 @@ def get_time_index(t_data,time):
     else:
         return len(t_data)
 
-        
-def PeakEnvelopeFit(y_data, t_data):
-    y_data_d = sps.detrend(y_data)
-    y = y_data_d - np.mean(y_data_d)
-    x = t_data
+def generate_strain_frequency_map(strain_list, freq_list, pow_list):
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 11,
+        "axes.labelsize": 12,
+        "axes.titlesize": 13,
+        "axes.linewidth": 1.2,
+        "grid.alpha": 0.25,
+        "grid.linestyle": "--"
+    })
 
-    if CUDA:
-        freq, power = ats.LombScargle(x,y,nterms=1).autopower(method="fastnifty")
-    else:
-        freq, power = ats.LombScargle(x,y,nterms=1).autopower()
-    best_freq = freq[np.argmax(power)]
-    dominant_period = 1 / best_freq
-    avg_peak_distance = dominant_period
-    #
-    peaks, _ = sps.find_peaks(y_data, distance=int(avg_peak_distance * 2))
-    peaks = peaks
-    t_peaks = t_data[peaks]
-    y_peaks = y_data[peaks]
+    powers = []
+    for p in pow_list:
+        #powers.append(np.log10(p))
+        powers.append(p)
 
-    peaks2, _  = sps.find_peaks(y_peaks, distance = 1, prominence = 0.01)
-    t_peaks_2 = t_peaks[peaks2]
-    y_peaks_2 = y_peaks[peaks2]
-
-    windows_size = 4
-    y_summits= spd.maximum_filter1d(y_peaks_2,size=windows_size)
-
-    envelope_func = spint.interp1d(t_peaks, y_peaks, kind='cubic', fill_value='extrapolate')
-    upper_env = envelope_func(t_data)
-
-    def model_curve(t, A, T, C):
-        return A * np.exp(-t/T) + C
+    frequencies = freq_list[0]
+    frequencies_safe = np.where(frequencies == 0, 1e-5, frequencies)
+    log_strain = np.log10(strain_list)
+    log_freq = np.log10(frequencies_safe)
+    PSD_grid = np.column_stack(powers)
+    PSD_dB = 10 * np.log10(np.clip(PSD_grid, 1e-15, None))
+    interp_func = spint.RegularGridInterpolator((log_freq, log_strain), PSD_dB, method='cubic', bounds_error=False, fill_value=None)
     
+    dense_log_strain = np.linspace(log_strain.min(), log_strain.max(), 500)
+    dense_log_freq = np.linspace(log_freq.min(), log_freq.max(), 500)
+    Dense_Log_Strain_Mesh, Dense_Log_Freq_Mesh = np.meshgrid(dense_log_strain, dense_log_freq)
 
-    intial_guess = [y_summits[0], 1000, 0]
-    popt_top, _ = spo.curve_fit(model_curve, t_peaks_2, y_summits, p0=intial_guess)
-    fit_line_top = model_curve(t_data, *popt_top)
-    A_fit, T_fit, C_fit = popt_top
+    dense_points = np.vstack([Dense_Log_Freq_Mesh.ravel(), Dense_Log_Strain_Mesh.ravel()]).T
+    PSD_dB_dense = interp_func(dense_points).reshape(Dense_Log_Strain_Mesh.shape)   
+
+    fig, ax = plt.subplots(figsize=(8.5, 6), dpi=300)
+
+    mesh = ax.pcolormesh(strain_list, frequencies_safe, PSD_dB, 
+                     shading='gouraud', 
+                     cmap='magma',
+                     vmin=-115, vmax=-20)
 
 
-    fig,ax = plt.subplots()
-    ax.plot(t_data, y_data, alpha=0.4, label='Data')
-    ax.plot(t_data, upper_env, 'r', linewidth=2, label='Peak Envelope')
-    ax.plot(t_peaks_2, y_peaks_2, 'kx', label='Peaks')
-    #ax.plot(t_data, fit, 'g--', linewidth=2, label=f'Fit: T={T_fit:.2f} ns')
-    ax.plot(t_data, fit_line_top, 'b--', linewidth=2, label=f'Fit: T={T_fit:.2f} ns')
-    plt.xlabel('Time (ns)')
-    plt.ylabel('Standard Deviation')
-    plt.title('Peak Envelope Fit')
-    plt.legend()
-    plt.show()
+    valid_data = PSD_dB_dense[PSD_dB_dense > -1000].flatten()
+    min_val = np.min(valid_data)
+    q25 = np.percentile(valid_data, 25)
+    p_low = 1.5 if (q25 - min_val) > 20 else 5.0
+    p_mid1 = 25.0
+    p_mid2 = 55.0
+    q75 = np.percentile(valid_data, 75)
+    max_val = np.max(valid_data)
+    p_high = 92.0 if (max_val - q75) < 15 else 85.0
+    dynamic_percentiles = [p_low, 15.0, 35.0, 55.0, 72.0, p_high]
+    contour_levels = np.percentile(valid_data, dynamic_percentiles)
+    print(f"Automatically generated contour levels for this file: {np.round(contour_levels, 1)} dB")
+    #contour_levels = np.arange(PSD_dB.min(), PSD_dB.max(), 15)
+    contours = ax.contour(10**Dense_Log_Strain_Mesh, 10**Dense_Log_Freq_Mesh, PSD_dB_dense, 
+                      levels=contour_levels, 
+                      colors="#000000ff",    
+                      linewidths=0.7,      
+                      alpha=0.75)
+
+    ax.set_xscale('log')  
+    ax.set_yscale('log')  
+    
+    ax.set_xlim(np.min(strain_list), np.max(strain_list))
+    ax.set_ylim(5e-4, 0.5)
+
+    #ax.set_xlabel('Applied Strain ($\epsilon$)', fontweight='bold', labelpad=8)
+    #ax.set_ylabel('Frequency Domain ($f$)', fontweight='bold', labelpad=8)
+
+    ax.grid(True, which="both", color="white", alpha=0.15)
+
+    plt.xlabel('Applied Strain ($\epsilon$)', fontweight='bold')
+    plt.ylabel('Frequency ($f$, GHz)', fontweight='bold')
+    plt.title('Decibel ($10 \log_{10}$ dB) Power Spectrogram', fontweight='bold')
+    cbar1 = plt.colorbar(mesh)
+    cbar1.set_label('Relative Power Intensity (dB)', fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('spectrogram_decibels.png', dpi=300)
+    plt.clf()
+
+    #-------------------------------------------------------------#
+
+    PSD_norm = np.zeros_like(PSD_grid)
+
+    for i in range(PSD_grid.shape[1]):
+        col_min = PSD_grid[:, i].min()
+        col_max = PSD_grid[:, i].max()
+        if col_max > col_min:
+            PSD_norm[:, i] = (PSD_grid[:, i] - col_min) / (col_max - col_min)
+
+    Y_freq_safe = np.where(frequencies == 0, 1e-5, frequencies)
+    
+    pcm2 = plt.pcolormesh(strain_list, Y_freq_safe, PSD_norm, 
+                        shading='auto', 
+                        cmap='magma', 
+                        vmin=0.0, vmax=1.0) # Scale is now locked strictly between 0 and 1
+
+    plt.xscale('log')
+    plt.yscale('log')
+
+    plt.xlabel('Applied Strain ($\epsilon$)', fontweight='bold')
+    plt.ylabel('Frequency ($f$, GHz)', fontweight='bold')
+    plt.title('Column-Normalized Structural Phase Map', fontweight='bold')
+
+    cbar2 = plt.colorbar(pcm2)
+    cbar2.set_label('Normalized Relative Intensity (0.0 to 1.0)', fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig('spectrogram_normalized_phase.png', dpi=300)
+    plt.clf()
+
+    #cbar = fig.colorbar(mesh, ax=ax, pad=0.02)
+    #cbar.set_label('Spectral Power Intensity (Residual Coherence)', 
+                   #fontweight='bold', labelpad=10)
+    
+    # 7. Add Regime Labels directly onto the map for presentation clarity
+    #ax.text(1.5e-5, 1e-1, 'I. Frozen\nRegime', color='white', alpha=0.7,
+    #        fontsize=9, fontweight='bold', bbox=dict(facecolor='black', alpha=0.4, boxstyle='round,pad=0.5'))
+    
+    #ax.text(4e-4, 1.5e-2, 'II. Underdamped\nCoherent Ringing\n(Modal Splintering)', color='black',
+    #        fontsize=9, fontweight='bold', bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.5'), ha='center')
+    
+    #ax.text(6e-3, 1e-1, 'III. Overdamped\nDissipation', color='white', alpha=0.7,
+    #        fontsize=9, fontweight='bold', bbox=dict(facecolor='black', alpha=0.4, boxstyle='round,pad=0.5'))
+
+    #plt.tight_layout()
+    #plt.savefig('strain_frequency_power_spectrogram-2.png', dpi=300)
+    #plt.show()
+
+def process_single_file(i, dat, window):
+    try:
+        # 1. Compute standard deviation window metrics
+        t, m, sd, sdsd = plot_standard_deviation(dat, 'gs.t0', i, window)
+        
+        # 2. Get data components for this specific unique group
+        indices = dat._index_map[dat.unique_groups[i]]
+        time = dat.data['Time(ns)'][indices]
+        signal = dat.data['gs.t0'][indices]
+        strain = dat.data['gs.strain.ex'][indices][0]
+        
+        # 3. Fit relaxation and compute spectrum
+        bound_T = partial(Calculate_T_relaxation, t, m, 10*window)
+        T, _, C, sn, f = Plot_T_on_TimeEvo(time, signal, bound_T)
+        
+        return {
+            'strain': strain,
+            'T': T,
+            'C': C,
+            'snr': sn,
+            'freq': f[0],
+            'fpow': f[1]
+        }
+    except Exception as e:
+        print(f"Error processing index {i}: {e}")
+        return None
+
 
 def main(load : bool = False):
 
@@ -570,30 +700,63 @@ def main(load : bool = False):
     T_times = []
     x = []
     C_val = []
-    std = []
-    for i in range(2,len(filenames)):
-        t, m, sd, sdsd = plot_standard_deviation(dat,'gs.t0', i,window)
-        time_idx = get_time_index(t,warm_up)
-        #mode_str = determine_fit_procedure(t[time_idx:],m[time_idx:])
-        mode_str = regime[i]
-        print("MODE: " + mode_str)
+    snr = []
+    freq = []
+    fpow = []
 
-        bound_T = partial(Calculate_T_relaxation,t,sdsd,1000, dist = 10000, mode=mode_str, fast_time =10000)
-        indicies = dat._index_map[dat.unique_groups[i]]
-        time = dat.data['Time(ns)'][indicies]
-        signal = dat.data['gs.t0'][indicies]
-        strain = dat.data['gs.strain.ex'][indicies][0]
-        T, _,C,S = Plot_T_on_TimeEvo(time,signal, bound_T)
-        T_times.append(T)
-        C_val.append(C)
-        x.append(strain)
-        std.append(S)
-        #plt.close()
+    indices_to_process = range(6, len(filenames))
+    worker_fn = partial(process_single_file, dat=dat, window=window)
+    for i in indices_to_process:
+        result = worker_fn(i)
+        if result is not None:
+            # Append the calculated values back to your master arrays
+            x.append(result['strain'])
+            T_times.append(result['T'])
+            C_val.append(result['C'])
+            snr.append(result['snr'])
+            freq.append(result['freq'])
+            fpow.append(result['fpow'])
+
+
+    #with concurrent.futures.ThreadPoolExecutor() as executor:
+    #    worker_fn = partial(process_single_file, dat=dat, window=window)
+    #    results = executor.map(worker_fn, indices_to_process)
+#
+    #    for result in results:
+    #        if result is not None:
+    #            # Append the calculated values back to your master arrays
+    #            x.append(result['strain'])
+    #            T_times.append(result['T'])
+    #            C_val.append(result['C'])
+    #            snr.append(result['snr'])
+    #            freq.append(result['freq'])
+    #            fpow.append(result['fpow'])
+#
+    #print(f"Successfully processed {len(x)} files in parallel!")
+
+    #for i in range(5,len(filenames)):
+    #    t, m, sd, sdsd = plot_standard_deviation(dat,'gs.t0', i,window)
+    #    #time_idx = get_time_index(t,warm_up)
+#
+    #    bound_T = partial(Calculate_T_relaxation,t,m,1000)
+    #    indicies = dat._index_map[dat.unique_groups[i]]
+    #    time = dat.data['Time(ns)'][indicies]
+    #    signal = dat.data['gs.t0'][indicies]
+    #    strain = dat.data['gs.strain.ex'][indicies][0]
+    #    T, _,C,sn,f = Plot_T_on_TimeEvo(time,signal, bound_T)
+    #    T_times.append(T)
+    #    C_val.append(C)
+    #    x.append(strain)
+    #    snr.append(sn)
+    #    freq.append(f[0])
+    #    fpow.append(f[1])
     
     fig,ax = plt.subplots()
-    ax.errorbar(x,T_times,yerr=std, fmt='o', capsize=5, capthick=1, color='blue',ecolor='red')
+    #ax.errorbar(x,T_times,yerr=std, fmt='o', capsize=5, capthick=1, color='blue',ecolor='red')
+    ax.scatter(x,T_times,color='blue')
     ax.set_yscale('log')
     ax.set_xscale('log')
+    strain = x
     log_y = np.log(T_times)
     log_x = np.log(x)
     slope,intercept = np.polyfit(log_x,log_y,1)
@@ -605,6 +768,18 @@ def main(load : bool = False):
     fit = a * (x_fit**b) 
     ax.plot(x_fit,fit,linestyle='--',color = 'black', linewidth=2)
     plt.show(block=True)
+    plt.savefig("T-relaxation.png")
+
+    fig,ax = plt.subplots()
+    ax.plot(strain,snr, '-o',color='red')
+    ax.set_xscale('log')
+    plt.show(block=False)
+    plt.savefig("SNR-ratio")
+
+    generate_strain_frequency_map(strain,freq,fpow)
+
+
+
 
     
 
